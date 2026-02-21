@@ -1,0 +1,16 @@
+freq_decomp: 0
+adaptive_band_predictor: 100
+cross_band_attn: 67,203
+collaborative: 901,385
+hat_feature_proj: 46,336
+dat_feature_proj: 46,336
+nafnet_feature_proj: 16,640
+multi_res_fusion: 1,387,627
+freq_router: 77,469
+multiscale: 60,288
+dynamic_selector: 225,924
+refine_net: 597,379
+expert_weights: 9
+band_importance: 3
+residual_scale: 1
+TOTAL: 3,426,700

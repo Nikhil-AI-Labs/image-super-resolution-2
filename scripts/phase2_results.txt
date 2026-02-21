@@ -1,0 +1,87 @@
+============================================================
+TEST 1: Standalone MultiDomainFrequencyDecomposition
+============================================================
+Device: cpu
+Parameters: 9,211
+  dct: 3
+  dwt: 4
+  fft: 4,099
+  band_fusion: 5,105
+
+Input: torch.Size([2, 3, 64, 64])
+Raw bands: 9
+  DCT_low: torch.Size([2, 3, 64, 64]) range=[-2.7679, 2.8822] nan=False
+  DCT_mid: torch.Size([2, 3, 64, 64]) range=[-2.2753, 2.1060] nan=False
+  DCT_high: torch.Size([2, 3, 64, 64]) range=[-2.7774, 2.5628] nan=False
+  DWT_LL: torch.Size([2, 3, 64, 64]) range=[-4.2039, 3.0816] nan=False
+  DWT_LH: torch.Size([2, 3, 64, 64]) range=[-2.6951, 3.0743] nan=False
+  DWT_HL: torch.Size([2, 3, 64, 64]) range=[-3.5669, 3.0482] nan=False
+  DWT_HH: torch.Size([2, 3, 64, 64]) range=[-2.7611, 3.3383] nan=False
+  FFT_low: torch.Size([2, 3, 64, 64]) range=[-1.6759, 1.5903] nan=False
+  FFT_high: torch.Size([2, 3, 64, 64]) range=[-3.1874, 3.5106] nan=False
+Fused bands: 3
+  guidance_0: torch.Size([2, 3, 64, 64]) range=[-0.4773, 0.5288] nan=False
+  guidance_1: torch.Size([2, 3, 64, 64]) range=[-0.4799, 0.3050] nan=False
+  guidance_2: torch.Size([2, 3, 64, 64]) range=[-0.4315, 0.5541] nan=False
+
+Gradient flow: 36/36 params have gradients
+
+Test 1 Result: PASS
+
+============================================================
+TEST 2: Full Model (Phase 1 + Phase 2)
+============================================================
+Total trainable params: 920,691
+
+Module breakdown:
+  multi_domain_freq: 9,211
+  cross_band_attn: 17,219
+  collaborative: 254,089
+  hat_feature_proj: 23,168
+  dat_feature_proj: 23,168
+  nafnet_feature_proj: 8,320
+  multi_res_fusion: 355,131
+  freq_router: 77,469
+  multiscale: 17,856
+  dynamic_selector: 57,668
+  refine_net: 77,379
+  (direct params): 13
+
+Forward pass:
+  Input: torch.Size([2, 3, 64, 64])
+  Output: torch.Size([2, 3, 256, 256])
+  Range: [0.0094, 0.9705]
+  Has NaN: False
+  Has Inf: False
+
+Gradient flow: 138/164 params (84.1%)
+Per-module gradient flow:
+  multi_domain_freq: 36/36
+  cross_band_attn: 10/10
+  collaborative: 24/24
+  hat_feature_proj: 0/2
+  dat_feature_proj: 0/2
+  nafnet_feature_proj: 0/2
+  multi_res_fusion: 39/39
+  freq_router: 0/18
+  multiscale: 10/10
+  dynamic_selector: 10/10
+  refine_net: 8/8
+
+Test 2 Result: PASS
+
+============================================================
+TEST 3: YAML Config Compatibility
+============================================================
+  fusion_dim: 64 (expected 64) - PASS
+  num_heads: 4 (expected 4) - PASS
+  refine_depth: 4 (expected 4) - PASS
+  refine_channels: 64 (expected 64) - PASS
+  enable_hierarchical: True (expected True) - PASS
+  enable_multi_domain_freq: True (expected True) - PASS
+
+Test 3 Result: PASS
+
+============================================================
+OVERALL: ALL TESTS PASSED
+============================================================

@@ -1,0 +1,74 @@
+============================================================
+TEST 1: Standalone Edge Enhancement
+============================================================
+Device: cpu
+
+  LaplacianPyramidRefinement: 89,147 params
+    Shape: torch.Size([2, 3, 256, 256]) -> torch.Size([2, 3, 256, 256])
+    Range: [0.0000, 1.0000]
+    NaN: False
+
+  Laplacian pyramid (3 levels):
+    Level 0: torch.Size([2, 3, 256, 256]), size=(256, 256), range=[-0.590, 0.899]
+    Level 1: torch.Size([2, 3, 128, 128]), size=(128, 128), range=[-0.219, 0.329]
+    Level 2: torch.Size([2, 3, 64, 64]), size=(64, 64), range=[0.077, 0.473]
+
+  Edge detection (sharp step): max Laplacian = 0.2925
+
+  Gradients: 46/46
+
+Test 1 Result: PASS
+
+============================================================
+TEST 2: Full Model (Phase 1 + 2 + 3 + 4)
+============================================================
+Total trainable params: 1,017,906
+
+Module breakdown:
+  multi_domain_freq: 9,211
+  cross_band_attn: 42,565
+  collaborative: 291,467
+  multi_res_fusion: 355,131
+  freq_router: 77,469
+  multiscale: 17,856
+  dynamic_selector: 57,668
+  refine_net: 77,379
+  edge_refine: 89,147
+  (direct params): 13
+
+Forward pass:
+  Input: torch.Size([2, 3, 64, 64])
+  Output: torch.Size([2, 3, 256, 256])
+  Range: [0.0019, 0.9397]
+  NaN: False
+  Inf: False
+
+Gradient flow: 222/242 (91.7%)
+Per-module gradient flow:
+  multi_domain_freq: 36/36
+  cross_band_attn: 26/26
+  collaborative: 46/46
+  multi_res_fusion: 39/39
+  freq_router: 0/18
+  multiscale: 10/10
+  dynamic_selector: 10/10
+  refine_net: 8/8
+  edge_refine: 46/46
+
+Edge-related params with gradients: 46
+
+Test 2 Result: PASS
+
+============================================================
+TEST 3: YAML Config Compatibility
+============================================================
+  enable_hierarchical: True (expected True) - PASS
+  enable_multi_domain_freq: True (expected True) - PASS
+  enable_lka: True (expected True) - PASS
+  enable_edge_enhance: True (expected True) - PASS
+
+Test 3 Result: PASS
+
+============================================================
+OVERALL: ALL TESTS PASSED
+============================================================

@@ -1,0 +1,74 @@
+============================================================
+TEST 1: Standalone LKA Modules
+============================================================
+Device: cpu
+
+  LargeKernelAttention: 8,512 params
+    Shape: torch.Size([2, 64, 64, 64]) -> torch.Size([2, 64, 64, 64])
+    NaN: False
+
+  LKABlock: 25,346 params
+    Shape: torch.Size([2, 64, 64, 64]) -> torch.Size([2, 64, 64, 64])
+
+  EnhancedCrossBandWithLKA: 42,565 params
+    Input: 9 bands, Output: 9 bands
+    Gradients: 26/26
+
+  EnhancedCollaborativeWithLKA: 291,467 params
+    Input: 3 experts, Output: 3 experts
+    Gradients: 46/46
+
+  LKA param total (cross-band + collab): 334,032
+
+Test 1 Result: PASS
+
+============================================================
+TEST 2: Full Model (Phase 1 + 2 + 3)
+============================================================
+Total trainable params: 928,759
+
+Module breakdown:
+  multi_domain_freq: 9,211
+  cross_band_attn: 42,565
+  collaborative: 291,467
+  multi_res_fusion: 355,131
+  freq_router: 77,469
+  multiscale: 17,856
+  dynamic_selector: 57,668
+  refine_net: 77,379
+  (direct params): 13
+
+Forward pass:
+  Input: torch.Size([2, 3, 64, 64])
+  Output: torch.Size([2, 3, 256, 256])
+  Range: [0.0000, 0.9158]
+  NaN: False
+  Inf: False
+
+Gradient flow: 176/196 (89.8%)
+Per-module gradient flow:
+  multi_domain_freq: 36/36
+  cross_band_attn: 26/26
+  collaborative: 46/46
+  multi_res_fusion: 39/39
+  freq_router: 0/18
+  multiscale: 10/10
+  dynamic_selector: 10/10
+  refine_net: 8/8
+
+LKA-related params with gradients: 32
+
+Test 2 Result: PASS
+
+============================================================
+TEST 3: YAML Config Compatibility
+============================================================
+  enable_hierarchical: True (expected True) - PASS
+  enable_multi_domain_freq: True (expected True) - PASS
+  enable_lka: True (expected True) - PASS
+
+Test 3 Result: PASS
+
+============================================================
+OVERALL: ALL TESTS PASSED
+============================================================

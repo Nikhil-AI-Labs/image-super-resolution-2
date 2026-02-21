@@ -1,0 +1,46 @@
+# ============================================================================
+# Image Super Resolution - .gitignore
+# ============================================================================
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ---- Pretrained weights (too large, stored on Google Drive) ----
+pretrained/
+*.safetensors
+
+# ---- Dataset images (download separately) ----
+DIV2K_test_LR_bicubic/
+dataset/
+
+# ---- Training outputs ----
+logs/
+outputs/
+results/
+
+# ---- Environment ----
+.env
+.venv/
+venv/
+env/
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- OS ----
+Thumbs.db
+.DS_Store
+
+# ---- Misc ----
+*.zip
+*.tar.gz
