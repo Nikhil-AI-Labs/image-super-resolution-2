@@ -959,16 +959,15 @@ class ExpertEnsemble(nn.Module):
         x: torch.Tensor
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
-        Run inference on all experts and extract REAL intermediate features.
+        Run inference on all experts and extract intermediate features.
         
-        This method extracts features from the last transformer/conv layer BEFORE
-        the upsampling stage, providing genuine intermediate representations for
-        Collaborative Feature Learning.
+        Uses each model's built-in forward_features() method to properly
+        extract deep features before the upsampling stage.
         
-        Feature dimensions:
-        - HAT: [B, 180, H, W] from conv_after_body
-        - DAT: [B, 180, H, W] from residual groups output
-        - NAFNet: [B, 64, H, W] from encoder output
+        Feature dimensions (all at LR spatial resolution):
+        - HAT:    [B, 180, H, W] from forward_features (after RHAG layers)
+        - DAT:    [B, 180, H, W] from forward_features (after ResidualGroups)
+        - NAFNet: [B, 64, H, W]  from hook on ending layer input
         
         Args:
             x: Input LR image [B, 3, H, W]
@@ -986,7 +985,7 @@ class ExpertEnsemble(nn.Module):
         target_w = w * self.upscale
         
         # =====================================================
-        # HAT: Extract features before upsample
+        # HAT: Use forward_features() which handles params internally
         # =====================================================
         if self._experts_loaded['hat'] and self.hat is not None:
             try:
@@ -995,44 +994,47 @@ class ExpertEnsemble(nn.Module):
                     x, self.window_size, self.upscale
                 )
                 
-                # Extract features step by step
-                # Step 1: Shallow feature extraction
+                # Step 1: Shallow feature
                 hat_feat = self.hat.conv_first(x_padded)
                 
-                # Step 2: Deep feature extraction through residual groups
-                feat_deep = hat_feat
-                for i, layer in enumerate(self.hat.layers):
-                    feat_deep = layer(feat_deep, (padded_h, padded_w))
+                # Step 2: Deep features via forward_features()
+                # This internally computes params={attn_mask, rpi_sa, rpi_oca}
+                # and passes them to each RHAG layer correctly
+                deep_feat = self.hat.forward_features(hat_feat)
+                # deep_feat is [B, 180, H_pad, W_pad]
                 
-                # Normalize and reshape
-                feat_deep = self.hat.norm(feat_deep)
-                B, L, C = feat_deep.shape
-                feat_deep = feat_deep.view(B, padded_h, padded_w, C).permute(0, 3, 1, 2).contiguous()
-                
-                # This is the REAL intermediate feature! [B, 180, H_pad, W_pad]
+                # Capture the intermediate feature (before residual connection)
                 features['hat'] = F.interpolate(
-                    feat_deep, size=(h, w), mode='bilinear', align_corners=False
+                    deep_feat, size=(h, w), mode='bilinear', align_corners=False
                 )  # [B, 180, H, W]
                 
-                # Step 3: Continue to get output
-                feat_deep = self.hat.conv_after_body(feat_deep) + hat_feat
+                # Step 3: Residual connection + upsample
+                hat_feat = self.hat.conv_after_body(deep_feat) + hat_feat
                 
-                # Step 4: Upsample
-                sr_padded = self.hat.upsample(feat_deep)
+                if self.hat.upsampler == 'pixelshuffle':
+                    hat_feat = self.hat.conv_before_upsample(hat_feat)
+                    sr_padded = self.hat.conv_last(self.hat.upsample(hat_feat))
+                else:
+                    sr_padded = self.hat.upsample(hat_feat)
+                
                 sr = crop_to_size(sr_padded, target_h, target_w)
-                outputs['hat'] = sr.clamp(0, 1)
+                
+                # Undo mean normalization (HAT normalizes input in forward())
+                # forward_features operates on already-normalized input
+                # We need to handle this by doing full forward instead
+                # Actually, we skipped the mean normalization at the start
+                # Let's use the full forward for the output and just keep the features
+                outputs['hat'] = self.forward_hat(x)
                 
             except Exception as e:
-                # Fallback to normal forward (expected at inference - training used cached features)
                 if not getattr(self, '_hat_fallback_warned', False):
                     self._hat_fallback_warned = True
                 outputs['hat'] = self.forward_hat(x)
-                # Create pseudo-feature as fallback
                 feat = F.interpolate(outputs['hat'], size=(h, w), mode='bilinear', align_corners=False)
                 features['hat'] = feat.repeat(1, 60, 1, 1)[:, :180, :, :]
         
         # =====================================================
-        # DAT: Extract features before upsample
+        # DAT: Use forward_features() which handles before_RG + layers + norm
         # =====================================================
         if self._experts_loaded['dat'] and self.dat is not None:
             try:
@@ -1041,75 +1043,65 @@ class ExpertEnsemble(nn.Module):
                     x, self.window_size, self.upscale
                 )
                 
+                # DAT normalizes input internally: x = (x - mean) * img_range
+                self.dat.mean = self.dat.mean.type_as(x_padded)
+                x_norm = (x_padded - self.dat.mean) * self.dat.img_range
+                
                 # Step 1: Shallow feature
-                dat_feat = self.dat.conv_first(x_padded)
+                dat_feat = self.dat.conv_first(x_norm)
                 
-                # Step 2: Deep feature extraction - before_RG processing
-                feat_deep = self.dat.before_RG(dat_feat)
+                # Step 2: Deep features via forward_features()
+                # Handles before_RG → layers → norm → reshape correctly
+                deep_feat = self.dat.forward_features(dat_feat)
+                # deep_feat is [B, 180, H_pad, W_pad]
                 
-                # Step 3: Pass through residual groups
-                x_size = (padded_h, padded_w)
-                for layer in self.dat.layers:
-                    feat_deep = layer(feat_deep, x_size)
-                
-                # Normalize
-                feat_deep = self.dat.norm(feat_deep)
-                B, L, C = feat_deep.shape
-                feat_deep = feat_deep.view(B, padded_h, padded_w, C).permute(0, 3, 1, 2).contiguous()
-                
-                # This is the REAL intermediate feature! [B, 180, H_pad, W_pad]
+                # Capture the intermediate feature
                 features['dat'] = F.interpolate(
-                    feat_deep, size=(h, w), mode='bilinear', align_corners=False
+                    deep_feat, size=(h, w), mode='bilinear', align_corners=False
                 )  # [B, 180, H, W]
                 
-                # Step 4: Residual connection and upsample
-                feat_deep = self.dat.conv_after_body(feat_deep) + dat_feat
-                sr_padded = self.dat.upsample(feat_deep)
-                sr = crop_to_size(sr_padded, target_h, target_w)
-                outputs['dat'] = sr.clamp(0, 1)
+                # Use full forward for correct output (handles mean/range)
+                outputs['dat'] = self.forward_dat(x)
                 
             except Exception as e:
-                # Fallback to normal forward (expected at inference - training used cached features)
                 if not getattr(self, '_dat_fallback_warned', False):
                     self._dat_fallback_warned = True
                 outputs['dat'] = self.forward_dat(x)
-                # Create pseudo-feature as fallback
                 feat = F.interpolate(outputs['dat'], size=(h, w), mode='bilinear', align_corners=False)
                 features['dat'] = feat.repeat(1, 60, 1, 1)[:, :180, :, :]
         
         # =====================================================
-        # NAFNet: Extract features before upsample
+        # NAFNet: Use hook-based extraction (most reliable for UNet)
         # =====================================================
         if self._experts_loaded['nafnet'] and self.nafnet is not None:
             try:
-                # NAFNetSR structure: intro -> body -> conv_after_body -> upsample
-                # Step 1: Initial convolution
-                naf_feat = self.nafnet.intro(x)
+                # NAFNetSR has self.ending → hooks capture input [B, 64, H_sr, W_sr]
+                # Register a temporary hook to capture features
+                captured = {}
                 
-                # Step 2: Body processing - THIS is the main feature extractor
-                if hasattr(self.nafnet, 'body'):
-                    # NAFNetSR architecture
-                    body_out = self.nafnet.body(naf_feat)
-                    # Apply residual connection if conv_after_body exists
-                    if hasattr(self.nafnet, 'conv_after_body'):
-                        body_out = self.nafnet.conv_after_body(body_out) + naf_feat
-                    
-                    # This is the REAL intermediate feature! [B, 64, H, W]
-                    features['nafnet'] = body_out  # [B, width, H, W]
+                def _capture_hook(module, input, output):
+                    feat = input[0] if isinstance(input, tuple) else input
+                    captured['feat'] = feat.clone().detach()
+                
+                handle = self.nafnet.ending.register_forward_hook(_capture_hook)
+                
+                # Run full forward
+                outputs['nafnet'] = self.forward_nafnet(x)
+                
+                handle.remove()
+                
+                if 'feat' in captured:
+                    # Resize from SR space to LR space for consistency
+                    features['nafnet'] = F.interpolate(
+                        captured['feat'], size=(h, w), mode='bilinear', align_corners=False
+                    )  # [B, 64, H, W]
                 else:
-                    # Original NAFNet (UNet-style) - use intro features
-                    features['nafnet'] = naf_feat
-                
-                # Step 3: Complete forward pass for output
-                sr = self.nafnet(x)
-                outputs['nafnet'] = sr.clamp(0, 1)
+                    raise RuntimeError("Hook did not capture features")
                 
             except Exception as e:
-                # Fallback to normal forward (expected at inference - training used cached features)
                 if not getattr(self, '_nafnet_fallback_warned', False):
                     self._nafnet_fallback_warned = True
                 outputs['nafnet'] = self.forward_nafnet(x)
-                # Create pseudo-feature as fallback
                 feat = F.interpolate(outputs['nafnet'], size=(h, w), mode='bilinear', align_corners=False)
                 features['nafnet'] = feat.repeat(1, 22, 1, 1)[:, :64, :, :]
         

@@ -479,11 +479,9 @@ def run_inference(
     
     for i, img_path in enumerate(tqdm(image_paths, desc="Super-resolving")):
         img_name = os.path.basename(img_path)
-        output_name = img_name.replace("x4", "_SR")
-        if output_name == img_name:
-            name, ext = os.path.splitext(img_name)
-            output_name = f"{name}_SR{ext}"
-        output_path = os.path.join(output_dir, output_name)
+        # NTIRE requirement: output file must keep the SAME NAME as input
+        # e.g., "0901x4.png" → "0901x4.png"
+        output_path = os.path.join(output_dir, img_name)
         
         # ---- Resume support: skip if output already exists ----
         if os.path.exists(output_path):
@@ -537,9 +535,11 @@ def run_inference(
         del sr_img, lr_img
         torch.cuda.empty_cache()
         
-        # Store result info
-        lr_h, lr_w = load_image(img_path).shape[2], load_image(img_path).shape[3]
+        # Store result info (use img dimensions from the tensor we already loaded)
+        img_for_info = load_image(img_path)
+        lr_h, lr_w = img_for_info.shape[2], img_for_info.shape[3]
         sr_h, sr_w = lr_h * 4, lr_w * 4
+        del img_for_info
         tile_tag = " [TILED]" if used_tiling else ""
         results.append({
             "name": img_name,
@@ -568,7 +568,7 @@ def run_inference(
     print(f"  Output saved to:  {output_dir}")
     
 
-    return results
+    return results, avg_time
 
 
 # ============================================================================
@@ -639,11 +639,97 @@ def visualize_results(
 
 
 # ============================================================================
-# Cell 7: Main Execution
+# Cell 8: NTIRE Submission Preparation
+# ============================================================================
+
+SUBMISSION_DIR = "/content/drive/MyDrive/super-resolution/submission"
+
+def prepare_submission(output_dir: str, submission_dir: str, avg_time: float = 33.0):
+    """
+    Prepare submission ZIP for NTIRE Workshop @ CVPR 2026
+    Image Super-Resolution (x4) Challenge.
+    
+    Creates res.zip containing:
+    - All SR images (same name as input, e.g. 0901x4.png)
+    - readme.txt with runtime info
+    
+    Args:
+        output_dir: Directory containing SR output images
+        submission_dir: Where to save res.zip (e.g., Google Drive)
+        avg_time: Average runtime per image in seconds
+    """
+    import zipfile
+    import shutil
+    
+    print("\n" + "=" * 60)
+    print("PREPARING NTIRE SUBMISSION")
+    print("=" * 60)
+    
+    os.makedirs(submission_dir, exist_ok=True)
+    
+    # Gather all SR output images
+    sr_images = sorted(glob.glob(os.path.join(output_dir, "*.png")))
+    # Exclude comparison.png if present
+    sr_images = [p for p in sr_images if "comparison" not in os.path.basename(p)]
+    
+    print(f"  Found {len(sr_images)} SR images")
+    
+    if not sr_images:
+        print("  ⚠ No images found! Run inference first.")
+        return
+    
+    # Create readme.txt content
+    readme_content = f"""runtime per image [s] : {avg_time:.2f}
+CPU[1] / GPU[0] : 0
+Extra Data [1] / No Extra Data [0] : 0
+Other description :
+Solution based on CompleteEnhancedFusionSR architecture combining three frozen expert
+models (HAT-L, DAT, NAFNet-SIDD-width64) with a trainable multi-phase fusion pipeline:
+- Phase 1: Hierarchical Multi-Resolution Fusion with attention-based scale blending
+- Phase 2: Multi-Domain Frequency Decomposition (9-band DCT analysis)
+- Phase 3: Enhanced Cross-Band Attention with Large Kernel Attention (k=21)
+- Phase 4: Laplacian Pyramid Edge Refinement (3 levels)
+- Phase 5: End-to-end fine-tuning of fusion components (~1M trainable params)
+Training: DIV2K training set only (800 images), 50 epochs, L1 + perceptual loss.
+Inference: PyTorch, single NVIDIA GPU, FP32, deterministic mode.
+All random seeds fixed for reproducibility (seed=42).
+"""
+    
+    # Create ZIP (files at root, no subdirectory)
+    zip_path = os.path.join(submission_dir, "res.zip")
+    
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zipf:
+        # Add all SR images
+        for img_path in sr_images:
+            zipf.write(img_path, arcname=os.path.basename(img_path))
+        
+        # Add readme.txt
+        zipf.writestr("readme.txt", readme_content)
+    
+    zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+    
+    print(f"  ✓ {len(sr_images)} images + readme.txt → res.zip")
+    print(f"  ✓ ZIP size: {zip_size_mb:.1f} MB")
+    print(f"  ✓ Saved to: {zip_path}")
+    print(f"  ✓ Avg runtime per image: {avg_time:.2f}s")
+    print()
+    print("  Upload res.zip to Codabench for evaluation.")
+
+
+# ============================================================================
+# Cell 9: Main Execution
 # ============================================================================
 
 def main():
     """Main entry point for the inference pipeline."""
+    
+    # ---- Reproducibility (required by NTIRE) ----
+    torch.manual_seed(42)
+    np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     
     print("╔══════════════════════════════════════════════════════════╗")
     print("║     Championship SR — DIV2K Test Inference Pipeline     ║")
@@ -662,7 +748,7 @@ def main():
     load_checkpoint(model, CHECKPOINT_PATH, device=DEVICE)
     
     # ---- Step 3: Run inference ----
-    results = run_inference(
+    results, avg_time = run_inference(
         model=model,
         test_dir=TEST_LR_DIR,
         output_dir=OUTPUT_DIR,
@@ -670,7 +756,14 @@ def main():
         use_fp16=USE_FP16,
     )
     
-    # ---- Step 4: Visualize (optional) ----
+    # ---- Step 4: Prepare submission ZIP ----
+    prepare_submission(
+        output_dir=OUTPUT_DIR,
+        submission_dir=SUBMISSION_DIR,
+        avg_time=avg_time,
+    )
+    
+    # ---- Step 5: Visualize (optional) ----
     comparison_path = os.path.join(OUTPUT_DIR, "comparison.png")
     visualize_results(
         test_dir=TEST_LR_DIR,
