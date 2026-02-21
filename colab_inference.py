@@ -747,6 +747,11 @@ def main():
     # ---- Step 2: Load checkpoint ----
     load_checkpoint(model, CHECKPOINT_PATH, device=DEVICE)
     
+    # ---- CRITICAL: Set model to eval mode ----
+    # Without this, self.training=True and collaborative learning
+    # (which OOMs on full-resolution) would still run during inference
+    model.eval()
+    
     # ---- Step 3: Run inference ----
     results, avg_time = run_inference(
         model=model,

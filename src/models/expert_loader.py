@@ -588,7 +588,7 @@ class ExpertEnsemble(nn.Module):
         
         return results
     
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward_hat(self, x: torch.Tensor) -> torch.Tensor:
         """
         Run HAT inference with proper window padding.
@@ -619,7 +619,7 @@ class ExpertEnsemble(nn.Module):
         
         return sr.clamp(0, 1)
     
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward_dat(self, x: torch.Tensor) -> torch.Tensor:
         """
         Run DAT inference with proper window padding.
@@ -651,12 +651,12 @@ class ExpertEnsemble(nn.Module):
         return sr.clamp(0, 1)
     
     # Backward compatibility alias
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward_mambair(self, x: torch.Tensor) -> torch.Tensor:
         """Alias for forward_dat (backward compatibility)."""
         return self.forward_dat(x)
     
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward_nafnet(self, x: torch.Tensor) -> torch.Tensor:
         """
         Run NAFNet-SR inference.

@@ -325,33 +325,44 @@ class CompleteEnhancedFusionSR(nn.Module):
             expert_outputs: Dict with SR outputs from each expert
             expert_features: Dict with REAL intermediate features (if collaborative enabled)
         """
+        import warnings
+        
         with torch.no_grad():
-            if self.enable_collaborative:
+            if self.enable_collaborative and self.training:
+                # Only extract features during training — skip at inference
+                # (cross-attention OOMs on full-resolution images)
+                
                 # Priority 1: Use HOOK-BASED extraction (most reliable)
                 if hasattr(self.expert_ensemble, 'forward_all_with_hooks'):
                     try:
                         expert_outputs, expert_features = self.expert_ensemble.forward_all_with_hooks(lr_input)
                         if expert_features:  # Hooks captured features
+                            # Clone outputs to ensure they're normal tensors
+                            expert_outputs = {k: v.clone().detach() for k, v in expert_outputs.items()}
                             return expert_outputs, expert_features
                     except Exception as e:
-                        pass  # Fall through to next method
+                        warnings.warn(f"Hook-based feature extraction failed: {e}")
                 
                 # Priority 2: Use manual step-by-step extraction
                 if hasattr(self.expert_ensemble, 'forward_all_with_features'):
                     try:
                         expert_outputs, expert_features = self.expert_ensemble.forward_all_with_features(lr_input)
                         if expert_features:
+                            expert_outputs = {k: v.clone().detach() for k, v in expert_outputs.items()}
                             return expert_outputs, expert_features
                     except Exception as e:
-                        pass
+                        warnings.warn(f"Manual feature extraction failed: {e}")
                 
                 # Priority 3: Fallback to pseudo-features
                 expert_outputs = self.expert_ensemble.forward_all(lr_input, return_dict=True)
                 expert_features = self._create_fallback_features(lr_input, expert_outputs)
             else:
-                # No collaborative learning - just get outputs
+                # No collaborative learning OR inference mode - just get outputs
                 expert_outputs = self.expert_ensemble.forward_all(lr_input, return_dict=True)
                 expert_features = None
+        
+        # Ensure all outputs are clean normal tensors (not inference_mode)
+        expert_outputs = {k: v.clone().detach() for k, v in expert_outputs.items()}
         
         return expert_outputs, expert_features
     
@@ -718,7 +729,11 @@ class CompleteEnhancedFusionSR(nn.Module):
         band_features, adaptive_splits = self.process_frequency_bands(lr_input)
         
         # Phase 4: Collaborative Feature Learning
-        enhanced_outputs = self.apply_collaborative_learning(expert_outputs, expert_features)
+        # Skip during inference — cross-attention OOMs on full-resolution images
+        if self.training:
+            enhanced_outputs = self.apply_collaborative_learning(expert_outputs, expert_features)
+        else:
+            enhanced_outputs = expert_outputs
         
         # Phase 5 & 6: Multi-Resolution Fusion + Dynamic Selection
         fused = self.fuse_experts(lr_input, enhanced_outputs, band_features)
