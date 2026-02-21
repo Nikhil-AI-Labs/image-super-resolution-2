@@ -215,8 +215,10 @@ def load_checkpoint(model: CompleteEnhancedFusionSR, checkpoint_path: str, devic
     """
     Load the trained checkpoint into the model.
     
-    The checkpoint contains 'model_state_dict' with weights for the entire
-    model (experts + fusion components).
+    IMPORTANT: Phase 5 was trained in CACHED MODE (expert_ensemble=None),
+    so the checkpoint only contains FUSION component weights (~1M params).
+    Expert weights (HAT, DAT, NAFNet ~170M params) are loaded separately
+    from pretrained files in build_expert_ensemble().
     """
     print("\n" + "=" * 60)
     print("LOADING CHECKPOINT")
@@ -242,29 +244,41 @@ def load_checkpoint(model: CompleteEnhancedFusionSR, checkpoint_path: str, devic
         for k, v in metrics.items():
             print(f"  {k}:      {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
     
-    # Load model weights
-    state_dict = checkpoint["model_state_dict"]
+    # Load FUSION weights only from checkpoint
+    # The checkpoint was trained in cached mode (expert_ensemble=None),
+    # so it only contains fusion/frequency/refinement weights.
+    # Expert weights are already loaded from pretrained files.
+    ckpt_state = checkpoint["model_state_dict"]
+    model_state = model.state_dict()
     
-    # Try strict loading first, fall back to non-strict
-    try:
-        model.load_state_dict(state_dict, strict=True)
-        print(f"\n  ✓ Loaded all {len(state_dict)} weight tensors (strict=True)")
-    except RuntimeError as e:
-        print(f"\n  ⚠ Strict loading failed, trying non-strict...")
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        print(f"  ✓ Loaded weights (strict=False)")
-        if missing:
-            print(f"  ⚠ Missing keys: {len(missing)}")
-            for k in missing[:5]:
-                print(f"      - {k}")
-            if len(missing) > 5:
-                print(f"      ... and {len(missing) - 5} more")
-        if unexpected:
-            print(f"  ⚠ Unexpected keys: {len(unexpected)}")
-            for k in unexpected[:5]:
-                print(f"      - {k}")
-            if len(unexpected) > 5:
-                print(f"      ... and {len(unexpected) - 5} more")
+    # Count what we're loading
+    loaded_count = 0
+    skipped_count = 0
+    
+    for key in ckpt_state:
+        if key in model_state:
+            # Shape check
+            if ckpt_state[key].shape == model_state[key].shape:
+                model_state[key] = ckpt_state[key]
+                loaded_count += 1
+            else:
+                print(f"  ⚠ Shape mismatch: {key} "
+                      f"(ckpt: {ckpt_state[key].shape}, "
+                      f"model: {model_state[key].shape})")
+                skipped_count += 1
+        else:
+            skipped_count += 1
+    
+    model.load_state_dict(model_state, strict=False)
+    
+    # Count expert vs fusion keys in current model
+    expert_keys = sum(1 for k in model_state if k.startswith("expert_ensemble."))
+    fusion_keys = len(model_state) - expert_keys
+    
+    print(f"\n  ✓ Loaded {loaded_count} checkpoint weight tensors")
+    print(f"  ℹ Skipped {skipped_count} keys (not in model or shape mismatch)")
+    print(f"  ℹ Expert weights ({expert_keys} tensors): loaded from pretrained files")
+    print(f"  ℹ Fusion weights ({fusion_keys} tensors): loaded from checkpoint")
     
     return checkpoint
 
@@ -550,3 +564,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
