@@ -342,7 +342,97 @@ def get_test_images(test_dir: str) -> list:
 
 
 # ============================================================================
-# Cell 5: Inference
+# Cell 5: Tiled Inference (for large images that cause OOM)
+# ============================================================================
+
+def tiled_forward(model, lr_img, tile_size=64, overlap=8, scale=4, device="cuda"):
+    """
+    Process a large image by splitting into overlapping tiles.
+    
+    This is the standard approach for SR inference on images larger
+    than what fits in GPU memory. Each LR tile is processed separately,
+    and the SR outputs are blended in the overlap regions.
+    
+    Args:
+        model: The SR model
+        lr_img: Input LR tensor [1, 3, H, W]
+        tile_size: Size of each LR tile (matches training patch size)
+        overlap: Overlap between adjacent tiles in LR space
+        scale: Upscaling factor
+        device: Device
+        
+    Returns:
+        SR output tensor [1, 3, H*scale, W*scale]
+    """
+    _, _, h, w = lr_img.shape
+    sr_h, sr_w = h * scale, w * scale
+    
+    # Output tensor and weight map for blending
+    sr_output = torch.zeros(1, 3, sr_h, sr_w, device=device)
+    weight_map = torch.zeros(1, 1, sr_h, sr_w, device=device)
+    
+    # Step size between tiles
+    step = tile_size - overlap
+    
+    # Generate tile positions
+    y_positions = list(range(0, h - tile_size + 1, step))
+    if y_positions[-1] + tile_size < h:
+        y_positions.append(h - tile_size)
+    
+    x_positions = list(range(0, w - tile_size + 1, step))
+    if x_positions[-1] + tile_size < w:
+        x_positions.append(w - tile_size)
+    
+    total_tiles = len(y_positions) * len(x_positions)
+    tile_idx = 0
+    
+    for y in y_positions:
+        for x in x_positions:
+            tile_idx += 1
+            
+            # Extract LR tile
+            lr_tile = lr_img[:, :, y:y+tile_size, x:x+tile_size]
+            
+            # Process tile
+            torch.cuda.empty_cache()
+            sr_tile = model(lr_tile)
+            
+            # SR coordinates
+            sy, sx = y * scale, x * scale
+            st = tile_size * scale
+            
+            # Create soft blending weight (raised cosine window)
+            # This ensures smooth transitions between tiles
+            wy = torch.ones(st, device=device)
+            wx = torch.ones(st, device=device)
+            
+            blend = min(overlap * scale, st // 4)  # Blend region in SR space
+            if blend > 0:
+                ramp = torch.linspace(0, 1, blend, device=device)
+                # Fade in at top/left, fade out at bottom/right
+                if y > 0:
+                    wy[:blend] = ramp
+                if y + tile_size < h:
+                    wy[-blend:] = 1 - ramp
+                if x > 0:
+                    wx[:blend] = ramp
+                if x + tile_size < w:
+                    wx[-blend:] = 1 - ramp
+            
+            weight = (wy.unsqueeze(1) * wx.unsqueeze(0)).unsqueeze(0).unsqueeze(0)
+            
+            # Accumulate
+            sr_output[:, :, sy:sy+st, sx:sx+st] += sr_tile * weight
+            weight_map[:, :, sy:sy+st, sx:sx+st] += weight
+    
+    # Normalize by weights
+    sr_output = sr_output / weight_map.clamp(min=1e-8)
+    
+    return sr_output
+
+
+# ============================================================================
+# Cell 6: Inference Loop (with resume + OOM tiling)
 # ============================================================================
 
 @torch.no_grad()
@@ -351,17 +441,13 @@ def run_inference(
     test_dir: str,
     output_dir: str,
     device: str = "cuda",
-    use_fp16: bool = True,
+    use_fp16: bool = False,
 ):
     """
-    Run inference on all test images.
+    Run inference on all test images with OOM-safe tiling and resume support.
     
-    Args:
-        model: The loaded CompleteEnhancedFusionSR model
-        test_dir: Path to directory containing LR test images
-        output_dir: Path to save SR output images
-        device: Device to run inference on
-        use_fp16: Whether to use half precision (faster on GPU)
+    - Skips images whose output already exists (resume from crash)
+    - Falls back to tiled inference if a full-image forward causes OOM
     """
     print("\n" + "=" * 60)
     print("RUNNING INFERENCE")
@@ -381,49 +467,80 @@ def run_inference(
     print(f"  Found {len(image_paths)} test images")
     print(f"  Output directory: {output_dir}")
     print(f"  Device: {device}")
-    print(f"  Using FP16: {use_fp16 and device == 'cuda'}")
     print()
     
     model.eval()
     
     total_time = 0
+    processed = 0
+    skipped = 0
+    tiled_count = 0
     results = []
     
     for i, img_path in enumerate(tqdm(image_paths, desc="Super-resolving")):
         img_name = os.path.basename(img_path)
         output_name = img_name.replace("x4", "_SR")
         if output_name == img_name:
-            # If no 'x4' in name, just add _SR prefix
             name, ext = os.path.splitext(img_name)
             output_name = f"{name}_SR{ext}"
         output_path = os.path.join(output_dir, output_name)
         
+        # ---- Resume support: skip if output already exists ----
+        if os.path.exists(output_path):
+            skipped += 1
+            continue
+        
         # Load image (always FP32 — HAT doesn't support FP16)
         lr_img = load_image(img_path).to(device)
         
-        # Run model
+        # Run model (try full image first, fall back to tiled)
         start_time = time.time()
+        used_tiling = False
         
         try:
+            torch.cuda.empty_cache()
             sr_img = model(lr_img)
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                print(f"\n  ⚠ OOM on {img_name}. Trying with float32...")
                 torch.cuda.empty_cache()
-                sr_img = model(lr_img)
+                tqdm.write(f"  ⚠ OOM on {img_name}, switching to tiled inference...")
+                try:
+                    sr_img = tiled_forward(
+                        model, lr_img,
+                        tile_size=64, overlap=8, scale=4, device=device
+                    )
+                    used_tiling = True
+                    tiled_count += 1
+                except RuntimeError as e2:
+                    if "out of memory" in str(e2).lower():
+                        torch.cuda.empty_cache()
+                        tqdm.write(f"  ⚠⚠ Still OOM with 64px tiles, trying 48px...")
+                        sr_img = tiled_forward(
+                            model, lr_img,
+                            tile_size=48, overlap=8, scale=4, device=device
+                        )
+                        used_tiling = True
+                        tiled_count += 1
+                    else:
+                        raise
             else:
                 raise
         
         elapsed = time.time() - start_time
         total_time += elapsed
-        
+        processed += 1
         
         # Save output
         save_image(sr_img, output_path)
         
+        # Free memory
+        del sr_img, lr_img
+        torch.cuda.empty_cache()
+        
         # Store result info
-        lr_h, lr_w = lr_img.shape[2], lr_img.shape[3]
-        sr_h, sr_w = sr_img.shape[2], sr_img.shape[3]
+        lr_h, lr_w = load_image(img_path).shape[2], load_image(img_path).shape[3]
+        sr_h, sr_w = lr_h * 4, lr_w * 4
+        tile_tag = " [TILED]" if used_tiling else ""
         results.append({
             "name": img_name,
             "lr_size": f"{lr_w}×{lr_h}",
@@ -431,23 +548,26 @@ def run_inference(
             "time": elapsed,
         })
         
-        # Print progress for first few and every 10th
-        if i < 3 or (i + 1) % 20 == 0:
+        # Print progress
+        if i < 3 or (i + 1) % 20 == 0 or used_tiling:
             tqdm.write(
                 f"  {img_name}: {lr_w}×{lr_h} → {sr_w}×{sr_h} "
-                f"({elapsed:.2f}s)"
+                f"({elapsed:.2f}s){tile_tag}"
             )
     
     # Summary
-    avg_time = total_time / len(image_paths) if image_paths else 0
+    avg_time = total_time / processed if processed else 0
     print(f"\n" + "=" * 60)
     print(f"INFERENCE COMPLETE")
     print(f"=" * 60)
-    print(f"  Images processed: {len(image_paths)}")
+    print(f"  Images processed: {processed}")
+    print(f"  Images skipped:   {skipped} (already existed)")
+    print(f"  Tiled fallback:   {tiled_count}")
     print(f"  Total time:       {total_time:.1f}s")
     print(f"  Average time:     {avg_time:.2f}s per image")
     print(f"  Output saved to:  {output_dir}")
     
+
     return results
 
 
