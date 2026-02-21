@@ -1,34 +1,14 @@
-"""
-Championship SR - Google Colab Inference Script
-=================================================
-Run 4× super-resolution on DIV2K test images using the
-CompleteEnhancedFusionSR model (Phase 5 checkpoint).
+from google.colab import drive
+drive.mount('/content/drive')
 
-Usage on Colab:
-    1. Upload this script and the project repo to your Drive
-    2. Mount Google Drive
-    3. Run all cells
-
-Author: NTIRE SR Team
-"""
-
-# ============================================================================
-# Cell 1: Setup & Installation
-# ============================================================================
-# Uncomment these lines when running in Google Colab:
-#
-# from google.colab import drive
-# drive.mount('/content/drive')
-#
-# # Clone the project repo
-# !git clone https://github.com/Nikhil-AI-Labs/image-super-resolution-2.git /content/project
+# !git clone https://github.com/Nikhil-AI-Labs/image-super-resolution-2.git
 #
 # # Install dependencies (torch & torchvision are pre-installed on Colab)
 # !pip install tqdm pyyaml pillow numpy
 #
 # # Download DIV2K test LR images (if not already on Drive)
-# # !wget https://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_test_LR_bicubic_X4.zip -O /content/DIV2K_test.zip
-# # !unzip -q /content/DIV2K_test.zip -d /content/project/
+# !wget https://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_test_LR_bicubic_X4.zip -O /content/DIV2K_test.zip
+# !unzip -q /content/DIV2K_test.zip -d /content/project/
 
 import os
 import sys
@@ -49,7 +29,7 @@ from pathlib import Path
 # Path to the project root (contains src/, configs/, etc.)
 # For local: use your local project path
 # For Colab: use "/content/project" (after cloning the repo)
-PROJECT_ROOT = "/content/project"  # <-- COLAB DEFAULT
+PROJECT_ROOT = "/content/image-super-resolution-2"  # <-- COLAB DEFAULT
 # PROJECT_ROOT = r"d:\image super resolution"  # <-- LOCAL WINDOWS
 
 # Path to the trained checkpoint (included in the GitHub repo)
@@ -61,7 +41,7 @@ CHECKPOINT_PATH = os.path.join(
 )
 
 # Path to the test LR images directory
-TEST_LR_DIR = os.path.join(PROJECT_ROOT, "DIV2K_test_LR_bicubic", "X4")
+TEST_LR_DIR = os.path.join("/content/drive/MyDrive/super-resolution", "DIV2K_test_LR_bicubic", "X4")
 
 # Output directory for super-resolved images
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "results", "colab_inference")
@@ -69,7 +49,7 @@ OUTPUT_DIR = os.path.join(PROJECT_ROOT, "results", "colab_inference")
 # Path to pretrained expert weights (HAT, DAT, NAFNet)
 # These are too large for GitHub (~80MB each), so load from Google Drive.
 # Upload the pretrained/ folder to your Drive and set this path:
-PRETRAINED_DIR = "/content/drive/MyDrive/pretrained"  # <-- COLAB DEFAULT
+PRETRAINED_DIR = "/content/drive/MyDrive/super-resolution/pretrained"  # <-- COLAB DEFAULT
 # PRETRAINED_DIR = os.path.join(PROJECT_ROOT, "pretrained")  # <-- LOCAL
 
 # ==================== MODEL CONFIG ====================
@@ -101,6 +81,29 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # All inference runs in FP32.
 USE_FP16 = False
 
+"""
+Championship SR - Google Colab Inference Script
+=================================================
+Run 4× super-resolution on DIV2K test images using the
+CompleteEnhancedFusionSR model (Phase 5 checkpoint).
+
+Usage on Colab:
+    1. Upload this script and the project repo to your Drive
+    2. Mount Google Drive
+    3. Run all cells
+
+Author: NTIRE SR Team
+"""
+
+# ============================================================================
+# Cell 1: Setup & Installation
+# ============================================================================
+# Uncomment these lines when running in Google Colab:
+
+#
+# # Clone the project repo
+
+
 # ============================================================================
 # Cell 3: Add project to path & import model
 # ============================================================================
@@ -124,7 +127,7 @@ def build_expert_ensemble(device: str = "cuda") -> expert_loader.ExpertEnsemble:
     print("=" * 60)
     
     ensemble = expert_loader.ExpertEnsemble(
-        scale=MODEL_CONFIG["scale"],
+        upscale=MODEL_CONFIG["scale"],
         device=device,
     )
     
