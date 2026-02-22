@@ -1,7 +1,7 @@
 from google.colab import drive
 drive.mount('/content/drive')
 
-# !git clone https://github.com/Nikhil-AI-Labs/image-super-resolution-2.git
+!git clone https://github.com/Nikhil-AI-Labs/image-super-resolution-2.git
 #
 # # Install dependencies (torch & torchvision are pre-installed on Colab)
 # !pip install tqdm pyyaml pillow numpy
@@ -248,23 +248,30 @@ def load_checkpoint(model: CompleteEnhancedFusionSR, checkpoint_path: str, devic
     # The checkpoint was trained in cached mode (expert_ensemble=None),
     # so it only contains fusion/frequency/refinement weights.
     # Expert weights are already loaded from pretrained files.
-    ckpt_state = checkpoint["model_state_dict"]
+    ckpt_state = checkpoint.get("model_state_dict", checkpoint)
     model_state = model.state_dict()
     
     # Count what we're loading
     loaded_count = 0
     skipped_count = 0
     
-    for key in ckpt_state:
-        if key in model_state:
+    for key, param in ckpt_state.items():
+        # CRITICAL FIX: Strip common prefixes from checkpoint keys
+        # DataParallel adds 'module.', some wrappers add 'model.'
+        clean_key = key
+        for prefix in ['module.', 'model.']:
+            if clean_key.startswith(prefix):
+                clean_key = clean_key[len(prefix):]
+        
+        if clean_key in model_state:
             # Shape check
-            if ckpt_state[key].shape == model_state[key].shape:
-                model_state[key] = ckpt_state[key]
+            if param.shape == model_state[clean_key].shape:
+                model_state[clean_key] = param
                 loaded_count += 1
             else:
-                print(f"  ⚠ Shape mismatch: {key} "
-                      f"(ckpt: {ckpt_state[key].shape}, "
-                      f"model: {model_state[key].shape})")
+                print(f"  \u26a0 Shape mismatch: {key} "
+                      f"(ckpt: {param.shape}, "
+                      f"model: {model_state[clean_key].shape})")
                 skipped_count += 1
         else:
             skipped_count += 1
@@ -275,10 +282,25 @@ def load_checkpoint(model: CompleteEnhancedFusionSR, checkpoint_path: str, devic
     expert_keys = sum(1 for k in model_state if k.startswith("expert_ensemble."))
     fusion_keys = len(model_state) - expert_keys
     
-    print(f"\n  ✓ Loaded {loaded_count} checkpoint weight tensors")
-    print(f"  ℹ Skipped {skipped_count} keys (not in model or shape mismatch)")
-    print(f"  ℹ Expert weights ({expert_keys} tensors): loaded from pretrained files")
-    print(f"  ℹ Fusion weights ({fusion_keys} tensors): loaded from checkpoint")
+    print(f"\n  \u2713 Loaded {loaded_count} checkpoint weight tensors")
+    print(f"  \u2139 Skipped {skipped_count} keys (not in model or shape mismatch)")
+    print(f"  \u2139 Expert weights ({expert_keys} tensors): loaded from pretrained files")
+    print(f"  \u2139 Fusion weights ({fusion_keys} tensors): loaded from checkpoint")
+    
+    # CRITICAL: Detect silent load failure
+    if loaded_count == 0:
+        print("\n  \u274c FATAL ERROR: 0 fusion weights loaded from checkpoint!")
+        print("    Checkpoint keys do not match model keys.")
+        print("    First 5 checkpoint keys:")
+        for i, k in enumerate(list(ckpt_state.keys())[:5]):
+            print(f"      {k}")
+        print("    First 5 model keys (non-expert):")
+        for i, k in enumerate([k for k in model_state if not k.startswith('expert_ensemble.')][:5]):
+            print(f"      {k}")
+        raise RuntimeError(
+            "Checkpoint loading failed: 0 weights matched! "
+            "The fusion network has random weights and will produce garbage output."
+        )
     
     return checkpoint
 
@@ -501,21 +523,24 @@ def run_inference(
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 torch.cuda.empty_cache()
-                tqdm.write(f"  ⚠ OOM on {img_name}, switching to tiled inference...")
+                tqdm.write(f"  \u26a0 OOM on {img_name}, switching to tiled inference (128px tiles)...")
                 try:
+                    # CRITICAL FIX: tile_size=128 with overlap=32
+                    # HAT/DAT are global transformers — 64px tiles cause
+                    # massive grid artifacts that destroy SSIM
                     sr_img = tiled_forward(
                         model, lr_img,
-                        tile_size=64, overlap=8, scale=4, device=device
+                        tile_size=128, overlap=32, scale=4, device=device
                     )
                     used_tiling = True
                     tiled_count += 1
                 except RuntimeError as e2:
                     if "out of memory" in str(e2).lower():
                         torch.cuda.empty_cache()
-                        tqdm.write(f"  ⚠⚠ Still OOM with 64px tiles, trying 48px...")
+                        tqdm.write(f"  \u26a0\u26a0 Still OOM with 128px tiles, trying 96px...")
                         sr_img = tiled_forward(
                             model, lr_img,
-                            tile_size=48, overlap=8, scale=4, device=device
+                            tile_size=96, overlap=24, scale=4, device=device
                         )
                         used_tiling = True
                         tiled_count += 1
