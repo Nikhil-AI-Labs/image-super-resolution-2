@@ -36,8 +36,13 @@ CHECKPOINT_PATH = os.path.join(
 # Path to the test LR images directory
 TEST_LR_DIR = os.path.join("/content/drive/MyDrive/super-resolution", "DIV2K_valid_LR_bicubic", "X4")
 
-# Output directory for super-resolved images
-OUTPUT_DIR = os.path.join(PROJECT_ROOT, "results", "colab_inference")
+# Output directory for super-resolved images — SAVED DIRECTLY TO GOOGLE DRIVE
+# so images persist across Colab disconnects. The resume logic in run_inference
+# will skip any images that already exist here, picking up where it left off.
+OUTPUT_DIR = "/content/drive/MyDrive/super-resolution/results/colab_inference"
+
+# Submission directory (also on Google Drive for safety)
+SUBMISSION_DIR = "/content/drive/MyDrive/super-resolution/submission"
 
 # Path to pretrained expert weights (HAT, DAT, NAFNet)
 # These are too large for GitHub (~80MB each), so load from Google Drive.
