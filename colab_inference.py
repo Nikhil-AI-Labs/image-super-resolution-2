@@ -34,7 +34,7 @@ CHECKPOINT_PATH = os.path.join(
 )
 
 # Path to the test LR images directory
-TEST_LR_DIR = os.path.join("/content/drive/MyDrive/super-resolution", "DIV2K_test_LR_bicubic", "X4")
+TEST_LR_DIR = os.path.join("/content/drive/MyDrive/super-resolution", "DIV2K_valid_LR_bicubic", "X4")
 
 # Output directory for super-resolved images
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "results", "colab_inference")
@@ -241,23 +241,30 @@ def load_checkpoint(model: CompleteEnhancedFusionSR, checkpoint_path: str, devic
     # The checkpoint was trained in cached mode (expert_ensemble=None),
     # so it only contains fusion/frequency/refinement weights.
     # Expert weights are already loaded from pretrained files.
-    ckpt_state = checkpoint["model_state_dict"]
+    ckpt_state = checkpoint.get("model_state_dict", checkpoint)
     model_state = model.state_dict()
 
     # Count what we're loading
     loaded_count = 0
     skipped_count = 0
 
-    for key in ckpt_state:
-        if key in model_state:
+    for key, param in ckpt_state.items():
+        # CRITICAL FIX: Strip common prefixes from checkpoint keys
+        # DataParallel adds 'module.', some wrappers add 'model.'
+        clean_key = key
+        for prefix in ['module.', 'model.']:
+            if clean_key.startswith(prefix):
+                clean_key = clean_key[len(prefix):]
+
+        if clean_key in model_state:
             # Shape check
-            if ckpt_state[key].shape == model_state[key].shape:
-                model_state[key] = ckpt_state[key]
+            if param.shape == model_state[clean_key].shape:
+                model_state[clean_key] = param
                 loaded_count += 1
             else:
-                print(f"  ⚠ Shape mismatch: {key} "
-                      f"(ckpt: {ckpt_state[key].shape}, "
-                      f"model: {model_state[key].shape})")
+                print(f"  \u26a0 Shape mismatch: {key} "
+                      f"(ckpt: {param.shape}, "
+                      f"model: {model_state[clean_key].shape})")
                 skipped_count += 1
         else:
             skipped_count += 1
@@ -268,10 +275,25 @@ def load_checkpoint(model: CompleteEnhancedFusionSR, checkpoint_path: str, devic
     expert_keys = sum(1 for k in model_state if k.startswith("expert_ensemble."))
     fusion_keys = len(model_state) - expert_keys
 
-    print(f"\n  ✓ Loaded {loaded_count} checkpoint weight tensors")
-    print(f"  ℹ Skipped {skipped_count} keys (not in model or shape mismatch)")
-    print(f"  ℹ Expert weights ({expert_keys} tensors): loaded from pretrained files")
-    print(f"  ℹ Fusion weights ({fusion_keys} tensors): loaded from checkpoint")
+    print(f"\n  \u2713 Loaded {loaded_count} checkpoint weight tensors")
+    print(f"  \u2139 Skipped {skipped_count} keys (not in model or shape mismatch)")
+    print(f"  \u2139 Expert weights ({expert_keys} tensors): loaded from pretrained files")
+    print(f"  \u2139 Fusion weights ({fusion_keys} tensors): loaded from checkpoint")
+
+    # CRITICAL: Detect silent load failure
+    if loaded_count == 0:
+        print("\n  \u274c FATAL ERROR: 0 fusion weights loaded from checkpoint!")
+        print("    Checkpoint keys do not match model keys.")
+        print("    First 5 checkpoint keys:")
+        for i, k in enumerate(list(ckpt_state.keys())[:5]):
+            print(f"      {k}")
+        print("    First 5 model keys (non-expert):")
+        for i, k in enumerate([k for k in model_state if not k.startswith('expert_ensemble.')][:5]):
+            print(f"      {k}")
+        raise RuntimeError(
+            "Checkpoint loading failed: 0 weights matched! "
+            "The fusion network has random weights and will produce garbage output."
+        )
 
     return checkpoint
 
@@ -424,9 +446,8 @@ def tiled_forward(model, lr_img, tile_size=64, overlap=8, scale=4, device="cuda"
     return sr_output
 
 
-
 # ============================================================================
-# Cell 5b: 8x Test-Time Augmentation (TTA)
+# Cell 5b: 8x Test-Time Augmentation (TTA) — Memory-Safe
 # ============================================================================
 
 def forward_tta(
@@ -439,18 +460,22 @@ def forward_tta(
     device: str = "cuda",
 ) -> torch.Tensor:
     """
-    8x geometric self-ensemble Test-Time Augmentation.
+    8x geometric self-ensemble Test-Time Augmentation (memory-safe).
     
     Applies all 8 combinations of horizontal flip × 90° rotations,
     runs each through the model, reverses the transformation on the
     SR output, and averages all 8 predictions in FP32.
+    
+    Memory safety: Each augmentation's output is detached and moved to
+    CPU immediately, then CUDA cache is cleared before the next pass.
+    Final averaging happens on CPU, result is moved back to device.
     
     Typical gain: +0.1 to +0.2 dB PSNR (free, no retraining needed).
     Cost: 8× inference time per image.
     
     Args:
         model: The SR model
-        lr_img: Input LR tensor [1, 3, H, W]
+        lr_img: Input LR tensor [1, 3, H, W] on device
         use_tiling: Whether to use tiled inference for each augmentation
         tile_size: Tile size for tiled inference (LR space)
         overlap: Overlap between tiles (LR space)
@@ -458,14 +483,14 @@ def forward_tta(
         device: Device
         
     Returns:
-        Averaged SR output [1, 3, H*scale, W*scale]
+        Averaged SR output [1, 3, H*scale, W*scale] on device
     """
     outputs = []
     
     for hflip in [False, True]:
         for rot in [0, 1, 2, 3]:
             # 1. Apply geometric transform to LR input
-            img_t = lr_img
+            img_t = lr_img.clone()
             if hflip:
                 img_t = torch.flip(img_t, [3])  # horizontal flip
             if rot > 0:
@@ -483,16 +508,21 @@ def forward_tta(
             if hflip:
                 sr_t = torch.flip(sr_t, [3])
             
-            outputs.append(sr_t)
+            # MEMORY SAFETY: Move to CPU to prevent GPU OOM
+            # 8 SR images at 2560×2560×3 float32 = ~600 MB on GPU
+            outputs.append(sr_t.detach().cpu())
+            del sr_t, img_t
+            torch.cuda.empty_cache()
     
-    # 4. Average all 8 predictions (FP32 for precision)
+    # 4. Average all 8 predictions on CPU (FP32 for precision)
     sr_final = torch.stack(outputs, dim=0).float().mean(dim=0)
     
-    return sr_final
+    # Move result back to device for saving
+    return sr_final.to(device)
 
 
 # ============================================================================
-# Cell 6: Inference Loop (with TTA + OOM-safe tiling + resume)
+# Cell 6: Inference Loop (with 8x TTA + OOM-safe tiling + resume)
 # ============================================================================
 
 @torch.no_grad()
@@ -564,7 +594,7 @@ def run_inference(
                 torch.cuda.empty_cache()
                 tqdm.write(f"  \u26a0 OOM on {img_name}, switching to tiled TTA (128px)...")
                 try:
-                    # Tiled TTA: each of the 8 augmentations is tiled
+                    # Tiled TTA: each of the 8 augmentations uses tiling
                     sr_img = forward_tta(
                         model, lr_img,
                         use_tiling=True, tile_size=128, overlap=32,
