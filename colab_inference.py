@@ -2,13 +2,6 @@ from google.colab import drive
 drive.mount('/content/drive')
 
 !git clone https://github.com/Nikhil-AI-Labs/image-super-resolution-2.git
-#
-# # Install dependencies (torch & torchvision are pre-installed on Colab)
-# !pip install tqdm pyyaml pillow numpy
-#
-# # Download DIV2K test LR images (if not already on Drive)
-# !wget https://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_test_LR_bicubic_X4.zip -O /content/DIV2K_test.zip
-# !unzip -q /content/DIV2K_test.zip -d /content/project/
 
 import os
 import sys
@@ -118,26 +111,26 @@ from src.models import expert_loader
 def build_expert_ensemble(device: str = "cuda") -> expert_loader.ExpertEnsemble:
     """
     Build the ExpertEnsemble with the 3 frozen experts: HAT, DAT, NAFNet.
-    
+
     The expert ensemble is needed to construct the full model architecture
     so that checkpoint loading works (state_dict keys must match).
     """
     print("=" * 60)
     print("LOADING EXPERT MODELS")
     print("=" * 60)
-    
+
     ensemble = expert_loader.ExpertEnsemble(
         upscale=MODEL_CONFIG["scale"],
         device=device,
     )
-    
+
     # Expert checkpoint paths
     expert_paths = {
         "hat": os.path.join(PRETRAINED_DIR, "hat", "HAT-L_SRx4_ImageNet-pretrain.pth"),
         "dat": os.path.join(PRETRAINED_DIR, "dat", "DAT_x4.pth"),
         "nafnet": os.path.join(PRETRAINED_DIR, "nafnet", "NAFNet-SIDD-width64.pth"),
     }
-    
+
     # Verify expert weight files exist
     for name, path in expert_paths.items():
         if os.path.exists(path):
@@ -146,33 +139,33 @@ def build_expert_ensemble(device: str = "cuda") -> expert_loader.ExpertEnsemble:
             print(f"  ⚠ Missing {name} weights: {path}")
             print(f"    Expert will be initialized with random weights.")
             print(f"    This is OK — trained checkpoint will overwrite them.")
-    
+
     # Load experts (they'll be frozen during inference anyway)
     results = ensemble.load_all_experts(
         checkpoint_paths=expert_paths,
         freeze=True,
     )
-    
+
     for name, success in results.items():
         status = "✓ loaded" if success else "⚠ random init"
         print(f"  {name}: {status}")
-    
+
     return ensemble
 
 
 def build_model(device: str = "cuda") -> CompleteEnhancedFusionSR:
     """
     Build the CompleteEnhancedFusionSR model matching the training config.
-    
+
     Returns the model with random weights — checkpoint loading happens next.
     """
     print("\n" + "=" * 60)
     print("BUILDING MODEL")
     print("=" * 60)
-    
+
     # Step 1: Build expert ensemble
     ensemble = build_expert_ensemble(device)
-    
+
     # Step 2: Build the fusion model with matching architecture params
     model = CompleteEnhancedFusionSR(
         expert_ensemble=ensemble,
@@ -194,27 +187,27 @@ def build_model(device: str = "cuda") -> CompleteEnhancedFusionSR:
         enable_multi_resolution=MODEL_CONFIG["enable_multi_resolution"],
         enable_collaborative=MODEL_CONFIG["enable_collaborative"],
     )
-    
+
     model = model.to(device)
-    
+
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
-    
+
     print(f"\n  Architecture: CompleteEnhancedFusionSR")
     print(f"  Total parameters:     {total_params:>12,}")
     print(f"  Trainable parameters: {trainable_params:>12,}")
     print(f"  Frozen parameters:    {frozen_params:>12,}")
     print(f"  Device:               {device}")
-    
+
     return model
 
 
 def load_checkpoint(model: CompleteEnhancedFusionSR, checkpoint_path: str, device: str = "cuda"):
     """
     Load the trained checkpoint into the model.
-    
+
     IMPORTANT: Phase 5 was trained in CACHED MODE (expert_ensemble=None),
     so the checkpoint only contains FUSION component weights (~1M params).
     Expert weights (HAT, DAT, NAFNet ~170M params) are loaded separately
@@ -223,85 +216,63 @@ def load_checkpoint(model: CompleteEnhancedFusionSR, checkpoint_path: str, devic
     print("\n" + "=" * 60)
     print("LOADING CHECKPOINT")
     print("=" * 60)
-    
+
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
             f"Checkpoint not found: {checkpoint_path}\n"
             f"Please upload the checkpoint to the correct path."
         )
-    
+
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    
+
     # Show checkpoint info
     epoch = checkpoint.get("epoch", "unknown")
     metrics = checkpoint.get("metrics", {})
     timestamp = checkpoint.get("timestamp", "unknown")
-    
+
     print(f"  Epoch:     {epoch}")
     print(f"  Timestamp: {timestamp}")
     if metrics:
         for k, v in metrics.items():
             print(f"  {k}:      {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
-    
+
     # Load FUSION weights only from checkpoint
     # The checkpoint was trained in cached mode (expert_ensemble=None),
     # so it only contains fusion/frequency/refinement weights.
     # Expert weights are already loaded from pretrained files.
-    ckpt_state = checkpoint.get("model_state_dict", checkpoint)
+    ckpt_state = checkpoint["model_state_dict"]
     model_state = model.state_dict()
-    
+
     # Count what we're loading
     loaded_count = 0
     skipped_count = 0
-    
-    for key, param in ckpt_state.items():
-        # CRITICAL FIX: Strip common prefixes from checkpoint keys
-        # DataParallel adds 'module.', some wrappers add 'model.'
-        clean_key = key
-        for prefix in ['module.', 'model.']:
-            if clean_key.startswith(prefix):
-                clean_key = clean_key[len(prefix):]
-        
-        if clean_key in model_state:
+
+    for key in ckpt_state:
+        if key in model_state:
             # Shape check
-            if param.shape == model_state[clean_key].shape:
-                model_state[clean_key] = param
+            if ckpt_state[key].shape == model_state[key].shape:
+                model_state[key] = ckpt_state[key]
                 loaded_count += 1
             else:
-                print(f"  \u26a0 Shape mismatch: {key} "
-                      f"(ckpt: {param.shape}, "
-                      f"model: {model_state[clean_key].shape})")
+                print(f"  ⚠ Shape mismatch: {key} "
+                      f"(ckpt: {ckpt_state[key].shape}, "
+                      f"model: {model_state[key].shape})")
                 skipped_count += 1
         else:
             skipped_count += 1
-    
+
     model.load_state_dict(model_state, strict=False)
-    
+
     # Count expert vs fusion keys in current model
     expert_keys = sum(1 for k in model_state if k.startswith("expert_ensemble."))
     fusion_keys = len(model_state) - expert_keys
-    
-    print(f"\n  \u2713 Loaded {loaded_count} checkpoint weight tensors")
-    print(f"  \u2139 Skipped {skipped_count} keys (not in model or shape mismatch)")
-    print(f"  \u2139 Expert weights ({expert_keys} tensors): loaded from pretrained files")
-    print(f"  \u2139 Fusion weights ({fusion_keys} tensors): loaded from checkpoint")
-    
-    # CRITICAL: Detect silent load failure
-    if loaded_count == 0:
-        print("\n  \u274c FATAL ERROR: 0 fusion weights loaded from checkpoint!")
-        print("    Checkpoint keys do not match model keys.")
-        print("    First 5 checkpoint keys:")
-        for i, k in enumerate(list(ckpt_state.keys())[:5]):
-            print(f"      {k}")
-        print("    First 5 model keys (non-expert):")
-        for i, k in enumerate([k for k in model_state if not k.startswith('expert_ensemble.')][:5]):
-            print(f"      {k}")
-        raise RuntimeError(
-            "Checkpoint loading failed: 0 weights matched! "
-            "The fusion network has random weights and will produce garbage output."
-        )
-    
+
+    print(f"\n  ✓ Loaded {loaded_count} checkpoint weight tensors")
+    print(f"  ℹ Skipped {skipped_count} keys (not in model or shape mismatch)")
+    print(f"  ℹ Expert weights ({expert_keys} tensors): loaded from pretrained files")
+    print(f"  ℹ Fusion weights ({fusion_keys} tensors): loaded from checkpoint")
+
     return checkpoint
 
 
@@ -312,10 +283,10 @@ def load_checkpoint(model: CompleteEnhancedFusionSR, checkpoint_path: str, devic
 def load_image(path: str) -> torch.Tensor:
     """
     Load an image and convert to a float32 tensor in [0, 1] range.
-    
+
     Args:
         path: Path to the image file
-        
+
     Returns:
         Tensor of shape [1, 3, H, W] in [0, 1] range
     """
@@ -328,18 +299,18 @@ def load_image(path: str) -> torch.Tensor:
 def save_image(tensor: torch.Tensor, path: str):
     """
     Save a tensor as a PNG image.
-    
+
     Args:
         tensor: Image tensor of shape [1, 3, H, W] or [3, H, W] in [0, 1] range
         path: Output file path
     """
     if tensor.dim() == 4:
         tensor = tensor.squeeze(0)
-    
+
     # Clamp to [0, 1] and convert to uint8
     tensor = tensor.clamp(0, 1)
     img_np = (tensor.permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
-    
+
     img = Image.fromarray(img_np)
     img.save(path, format="PNG")
 
@@ -347,10 +318,10 @@ def save_image(tensor: torch.Tensor, path: str):
 def get_test_images(test_dir: str) -> list:
     """
     Get sorted list of test image paths from the LR directory.
-    
+
     Args:
         test_dir: Path to the test LR images directory
-        
+
     Returns:
         Sorted list of image file paths
     """
@@ -358,7 +329,7 @@ def get_test_images(test_dir: str) -> list:
     image_paths = []
     for ext in extensions:
         image_paths.extend(glob.glob(os.path.join(test_dir, ext)))
-    
+
     image_paths.sort()
     return image_paths
 
@@ -370,11 +341,11 @@ def get_test_images(test_dir: str) -> list:
 def tiled_forward(model, lr_img, tile_size=64, overlap=8, scale=4, device="cuda"):
     """
     Process a large image by splitting into overlapping tiles.
-    
+
     This is the standard approach for SR inference on images larger
     than what fits in GPU memory. Each LR tile is processed separately,
     and the SR outputs are blended in the overlap regions.
-    
+
     Args:
         model: The SR model
         lr_img: Input LR tensor [1, 3, H, W]
@@ -382,52 +353,52 @@ def tiled_forward(model, lr_img, tile_size=64, overlap=8, scale=4, device="cuda"
         overlap: Overlap between adjacent tiles in LR space
         scale: Upscaling factor
         device: Device
-        
+
     Returns:
         SR output tensor [1, 3, H*scale, W*scale]
     """
     _, _, h, w = lr_img.shape
     sr_h, sr_w = h * scale, w * scale
-    
+
     # Output tensor and weight map for blending
     sr_output = torch.zeros(1, 3, sr_h, sr_w, device=device)
     weight_map = torch.zeros(1, 1, sr_h, sr_w, device=device)
-    
+
     # Step size between tiles
     step = tile_size - overlap
-    
+
     # Generate tile positions
     y_positions = list(range(0, h - tile_size + 1, step))
     if y_positions[-1] + tile_size < h:
         y_positions.append(h - tile_size)
-    
+
     x_positions = list(range(0, w - tile_size + 1, step))
     if x_positions[-1] + tile_size < w:
         x_positions.append(w - tile_size)
-    
+
     total_tiles = len(y_positions) * len(x_positions)
     tile_idx = 0
-    
+
     for y in y_positions:
         for x in x_positions:
             tile_idx += 1
-            
+
             # Extract LR tile
             lr_tile = lr_img[:, :, y:y+tile_size, x:x+tile_size]
-            
+
             # Process tile
             torch.cuda.empty_cache()
             sr_tile = model(lr_tile)
-            
+
             # SR coordinates
             sy, sx = y * scale, x * scale
             st = tile_size * scale
-            
+
             # Create soft blending weight (raised cosine window)
             # This ensures smooth transitions between tiles
             wy = torch.ones(st, device=device)
             wx = torch.ones(st, device=device)
-            
+
             blend = min(overlap * scale, st // 4)  # Blend region in SR space
             if blend > 0:
                 ramp = torch.linspace(0, 1, blend, device=device)
@@ -440,21 +411,88 @@ def tiled_forward(model, lr_img, tile_size=64, overlap=8, scale=4, device="cuda"
                     wx[:blend] = ramp
                 if x + tile_size < w:
                     wx[-blend:] = 1 - ramp
-            
+
             weight = (wy.unsqueeze(1) * wx.unsqueeze(0)).unsqueeze(0).unsqueeze(0)
-            
+
             # Accumulate
             sr_output[:, :, sy:sy+st, sx:sx+st] += sr_tile * weight
             weight_map[:, :, sy:sy+st, sx:sx+st] += weight
-    
+
     # Normalize by weights
     sr_output = sr_output / weight_map.clamp(min=1e-8)
-    
+
     return sr_output
 
 
+
 # ============================================================================
-# Cell 6: Inference Loop (with resume + OOM tiling)
+# Cell 5b: 8x Test-Time Augmentation (TTA)
+# ============================================================================
+
+def forward_tta(
+    model: CompleteEnhancedFusionSR,
+    lr_img: torch.Tensor,
+    use_tiling: bool = False,
+    tile_size: int = 128,
+    overlap: int = 32,
+    scale: int = 4,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """
+    8x geometric self-ensemble Test-Time Augmentation.
+    
+    Applies all 8 combinations of horizontal flip × 90° rotations,
+    runs each through the model, reverses the transformation on the
+    SR output, and averages all 8 predictions in FP32.
+    
+    Typical gain: +0.1 to +0.2 dB PSNR (free, no retraining needed).
+    Cost: 8× inference time per image.
+    
+    Args:
+        model: The SR model
+        lr_img: Input LR tensor [1, 3, H, W]
+        use_tiling: Whether to use tiled inference for each augmentation
+        tile_size: Tile size for tiled inference (LR space)
+        overlap: Overlap between tiles (LR space)
+        scale: Upscaling factor
+        device: Device
+        
+    Returns:
+        Averaged SR output [1, 3, H*scale, W*scale]
+    """
+    outputs = []
+    
+    for hflip in [False, True]:
+        for rot in [0, 1, 2, 3]:
+            # 1. Apply geometric transform to LR input
+            img_t = lr_img
+            if hflip:
+                img_t = torch.flip(img_t, [3])  # horizontal flip
+            if rot > 0:
+                img_t = torch.rot90(img_t, rot, [2, 3])  # rotate 90° × rot
+            
+            # 2. Forward pass
+            if use_tiling:
+                sr_t = tiled_forward(model, img_t, tile_size, overlap, scale, device)
+            else:
+                sr_t = model(img_t)
+            
+            # 3. Reverse the transform on SR output
+            if rot > 0:
+                sr_t = torch.rot90(sr_t, -rot, [2, 3])
+            if hflip:
+                sr_t = torch.flip(sr_t, [3])
+            
+            outputs.append(sr_t)
+    
+    # 4. Average all 8 predictions (FP32 for precision)
+    sr_final = torch.stack(outputs, dim=0).float().mean(dim=0)
+    
+    return sr_final
+
+
+# ============================================================================
+# Cell 6: Inference Loop (with TTA + OOM-safe tiling + resume)
 # ============================================================================
 
 @torch.no_grad()
@@ -467,80 +505,81 @@ def run_inference(
 ):
     """
     Run inference on all test images with OOM-safe tiling and resume support.
-    
+
     - Skips images whose output already exists (resume from crash)
     - Falls back to tiled inference if a full-image forward causes OOM
     """
     print("\n" + "=" * 60)
     print("RUNNING INFERENCE")
     print("=" * 60)
-    
+
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
-    
+
     # Get test images
     image_paths = get_test_images(test_dir)
-    
+
     if not image_paths:
         print(f"  ⚠ No images found in: {test_dir}")
         print(f"    Expected .png files in the directory.")
         return
-    
+
     print(f"  Found {len(image_paths)} test images")
     print(f"  Output directory: {output_dir}")
     print(f"  Device: {device}")
     print()
-    
+
     model.eval()
-    
+
     total_time = 0
     processed = 0
     skipped = 0
     tiled_count = 0
     results = []
-    
+
     for i, img_path in enumerate(tqdm(image_paths, desc="Super-resolving")):
         img_name = os.path.basename(img_path)
         # NTIRE requirement: output file must keep the SAME NAME as input
         # e.g., "0901x4.png" → "0901x4.png"
         output_path = os.path.join(output_dir, img_name)
-        
+
         # ---- Resume support: skip if output already exists ----
         if os.path.exists(output_path):
             skipped += 1
             continue
-        
+
         # Load image (always FP32 — HAT doesn't support FP16)
         lr_img = load_image(img_path).to(device)
-        
+
         # Run model (try full image first, fall back to tiled)
         start_time = time.time()
         used_tiling = False
-        
+
         try:
             torch.cuda.empty_cache()
-            sr_img = model(lr_img)
+            # 8x TTA: geometric self-ensemble for +0.1-0.2 dB free boost
+            sr_img = forward_tta(model, lr_img, use_tiling=False, device=device)
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 torch.cuda.empty_cache()
-                tqdm.write(f"  \u26a0 OOM on {img_name}, switching to tiled inference (128px tiles)...")
+                tqdm.write(f"  \u26a0 OOM on {img_name}, switching to tiled TTA (128px)...")
                 try:
-                    # CRITICAL FIX: tile_size=128 with overlap=32
-                    # HAT/DAT are global transformers — 64px tiles cause
-                    # massive grid artifacts that destroy SSIM
-                    sr_img = tiled_forward(
+                    # Tiled TTA: each of the 8 augmentations is tiled
+                    sr_img = forward_tta(
                         model, lr_img,
-                        tile_size=128, overlap=32, scale=4, device=device
+                        use_tiling=True, tile_size=128, overlap=32,
+                        scale=4, device=device
                     )
                     used_tiling = True
                     tiled_count += 1
                 except RuntimeError as e2:
                     if "out of memory" in str(e2).lower():
                         torch.cuda.empty_cache()
-                        tqdm.write(f"  \u26a0\u26a0 Still OOM with 128px tiles, trying 96px...")
-                        sr_img = tiled_forward(
+                        tqdm.write(f"  \u26a0\u26a0 Still OOM, trying 96px tiled TTA...")
+                        sr_img = forward_tta(
                             model, lr_img,
-                            tile_size=96, overlap=24, scale=4, device=device
+                            use_tiling=True, tile_size=96, overlap=24,
+                            scale=4, device=device
                         )
                         used_tiling = True
                         tiled_count += 1
@@ -548,18 +587,18 @@ def run_inference(
                         raise
             else:
                 raise
-        
+
         elapsed = time.time() - start_time
         total_time += elapsed
         processed += 1
-        
+
         # Save output
         save_image(sr_img, output_path)
-        
+
         # Free memory
         del sr_img, lr_img
         torch.cuda.empty_cache()
-        
+
         # Store result info (use img dimensions from the tensor we already loaded)
         img_for_info = load_image(img_path)
         lr_h, lr_w = img_for_info.shape[2], img_for_info.shape[3]
@@ -572,14 +611,14 @@ def run_inference(
             "sr_size": f"{sr_w}×{sr_h}",
             "time": elapsed,
         })
-        
+
         # Print progress
         if i < 3 or (i + 1) % 20 == 0 or used_tiling:
             tqdm.write(
                 f"  {img_name}: {lr_w}×{lr_h} → {sr_w}×{sr_h} "
                 f"({elapsed:.2f}s){tile_tag}"
             )
-    
+
     # Summary
     avg_time = total_time / processed if processed else 0
     print(f"\n" + "=" * 60)
@@ -591,7 +630,7 @@ def run_inference(
     print(f"  Total time:       {total_time:.1f}s")
     print(f"  Average time:     {avg_time:.2f}s per image")
     print(f"  Output saved to:  {output_dir}")
-    
+
 
     return results, avg_time
 
@@ -608,7 +647,7 @@ def visualize_results(
 ):
     """
     Display side-by-side LR/SR comparisons.
-    
+
     Args:
         test_dir: Path to LR test images
         output_dir: Path to SR output images
@@ -620,45 +659,45 @@ def visualize_results(
     except ImportError:
         print("matplotlib not available, skipping visualization.")
         return
-    
+
     lr_paths = sorted(get_test_images(test_dir))
     sr_paths = sorted(glob.glob(os.path.join(output_dir, "*.png")))
-    
+
     if not sr_paths:
         print("No SR images found to visualize.")
         return
-    
+
     num_samples = min(num_samples, len(sr_paths))
-    
+
     # Select evenly spaced samples
     indices = np.linspace(0, len(sr_paths) - 1, num_samples, dtype=int)
-    
+
     fig, axes = plt.subplots(num_samples, 2, figsize=(12, 5 * num_samples))
     if num_samples == 1:
         axes = axes.reshape(1, -1)
-    
+
     for idx, sample_idx in enumerate(indices):
         lr_img = Image.open(lr_paths[sample_idx]).convert("RGB")
         sr_img = Image.open(sr_paths[sample_idx]).convert("RGB")
-        
+
         lr_name = os.path.basename(lr_paths[sample_idx])
         sr_name = os.path.basename(sr_paths[sample_idx])
-        
+
         axes[idx, 0].imshow(lr_img)
         axes[idx, 0].set_title(f"LR Input ({lr_img.size[0]}×{lr_img.size[1]})\n{lr_name}", fontsize=11)
         axes[idx, 0].axis("off")
-        
+
         axes[idx, 1].imshow(sr_img)
         axes[idx, 1].set_title(f"SR Output ({sr_img.size[0]}×{sr_img.size[1]})\n{sr_name}", fontsize=11)
         axes[idx, 1].axis("off")
-    
+
     plt.suptitle("Championship SR — 4× Super Resolution Results", fontsize=14, fontweight="bold")
     plt.tight_layout()
-    
+
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"  ✓ Comparison saved to: {save_path}")
-    
+
     plt.show()
     plt.close()
 
@@ -673,11 +712,11 @@ def prepare_submission(output_dir: str, submission_dir: str, avg_time: float = 3
     """
     Prepare submission ZIP for NTIRE Workshop @ CVPR 2026
     Image Super-Resolution (x4) Challenge.
-    
+
     Creates res.zip containing:
     - All SR images (same name as input, e.g. 0901x4.png)
     - readme.txt with runtime info
-    
+
     Args:
         output_dir: Directory containing SR output images
         submission_dir: Where to save res.zip (e.g., Google Drive)
@@ -685,24 +724,24 @@ def prepare_submission(output_dir: str, submission_dir: str, avg_time: float = 3
     """
     import zipfile
     import shutil
-    
+
     print("\n" + "=" * 60)
     print("PREPARING NTIRE SUBMISSION")
     print("=" * 60)
-    
+
     os.makedirs(submission_dir, exist_ok=True)
-    
+
     # Gather all SR output images
     sr_images = sorted(glob.glob(os.path.join(output_dir, "*.png")))
     # Exclude comparison.png if present
     sr_images = [p for p in sr_images if "comparison" not in os.path.basename(p)]
-    
+
     print(f"  Found {len(sr_images)} SR images")
-    
+
     if not sr_images:
         print("  ⚠ No images found! Run inference first.")
         return
-    
+
     # Create readme.txt content
     readme_content = f"""runtime per image [s] : {avg_time:.2f}
 CPU[1] / GPU[0] : 0
@@ -719,20 +758,20 @@ Training: DIV2K training set only (800 images), 50 epochs, L1 + perceptual loss.
 Inference: PyTorch, single NVIDIA GPU, FP32, deterministic mode.
 All random seeds fixed for reproducibility (seed=42).
 """
-    
+
     # Create ZIP (files at root, no subdirectory)
     zip_path = os.path.join(submission_dir, "res.zip")
-    
+
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zipf:
         # Add all SR images
         for img_path in sr_images:
             zipf.write(img_path, arcname=os.path.basename(img_path))
-        
+
         # Add readme.txt
         zipf.writestr("readme.txt", readme_content)
-    
+
     zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
-    
+
     print(f"  ✓ {len(sr_images)} images + readme.txt → res.zip")
     print(f"  ✓ ZIP size: {zip_size_mb:.1f} MB")
     print(f"  ✓ Saved to: {zip_path}")
@@ -747,7 +786,7 @@ All random seeds fixed for reproducibility (seed=42).
 
 def main():
     """Main entry point for the inference pipeline."""
-    
+
     # ---- Reproducibility (required by NTIRE) ----
     torch.manual_seed(42)
     np.random.seed(42)
@@ -755,7 +794,7 @@ def main():
         torch.cuda.manual_seed_all(42)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-    
+
     print("╔══════════════════════════════════════════════════════════╗")
     print("║     Championship SR — DIV2K Test Inference Pipeline     ║")
     print("╚══════════════════════════════════════════════════════════╝")
@@ -765,18 +804,18 @@ def main():
     print(f"  Test dir:   {TEST_LR_DIR}")
     print(f"  Output dir: {OUTPUT_DIR}")
     print()
-    
+
     # ---- Step 1: Build model ----
     model = build_model(device=DEVICE)
-    
+
     # ---- Step 2: Load checkpoint ----
     load_checkpoint(model, CHECKPOINT_PATH, device=DEVICE)
-    
+
     # ---- CRITICAL: Set model to eval mode ----
     # Without this, self.training=True and collaborative learning
     # (which OOMs on full-resolution) would still run during inference
     model.eval()
-    
+
     # ---- Step 3: Run inference ----
     results, avg_time = run_inference(
         model=model,
@@ -785,14 +824,14 @@ def main():
         device=DEVICE,
         use_fp16=USE_FP16,
     )
-    
+
     # ---- Step 4: Prepare submission ZIP ----
     prepare_submission(
         output_dir=OUTPUT_DIR,
         submission_dir=SUBMISSION_DIR,
         avg_time=avg_time,
     )
-    
+
     # ---- Step 5: Visualize (optional) ----
     comparison_path = os.path.join(OUTPUT_DIR, "comparison.png")
     visualize_results(
@@ -801,7 +840,7 @@ def main():
         num_samples=4,
         save_path=comparison_path,
     )
-    
+
     print("\n✓ All done!")
 
 
