@@ -64,6 +64,9 @@ class CheckpointManager:
         self.history_file = self.checkpoint_dir / 'training_history.json'
         self.history = self._load_history()
         
+        # Restore best_checkpoints from history (fixes "amnesia bug" on resume)
+        self._restore_best_from_history()
+        
         print(f"\n{'=' * 70}")
         print("CHECKPOINT MANAGER INITIALIZED")
         print(f"{'=' * 70}")
@@ -71,6 +74,8 @@ class CheckpointManager:
         print(f"  Keep best: {self.keep_best_k}")
         print(f"  Save every: {self.save_every} epochs")
         print(f"  Metric: {self.metric_name} ({self.mode})")
+        if self.best_checkpoints:
+            print(f"  Restored best: {self.best_checkpoints[0][0]:.4f} ({self.metric_name})")
         print(f"{'=' * 70}\n")
     
     def save_checkpoint(
@@ -81,7 +86,8 @@ class CheckpointManager:
         scheduler: Optional[Any] = None,
         metrics: Optional[Dict[str, float]] = None,
         is_best: bool = False,
-        extra_state: Optional[Dict] = None
+        extra_state: Optional[Dict] = None,
+        ema = None
     ) -> str:
         """
         Save training checkpoint with atomic write for safety.
@@ -94,6 +100,7 @@ class CheckpointManager:
             metrics: Current metrics
             is_best: Whether this is the best checkpoint
             extra_state: Additional state to save
+            ema: EMAModel instance (optional) — shadow weights saved for resume
             
         Returns:
             Path to saved checkpoint
@@ -109,6 +116,11 @@ class CheckpointManager:
         
         if scheduler is not None:
             checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+        
+        # Save EMA shadow weights (critical for resume!)
+        if ema is not None and hasattr(ema, 'state_dict'):
+            checkpoint['ema_state_dict'] = ema.state_dict()
+            print(f"  ✓ EMA state saved ({len(ema.shadow)} shadow params)")
         
         if extra_state is not None:
             checkpoint.update(extra_state)
@@ -194,7 +206,7 @@ class CheckpointManager:
             Checkpoint dictionary
         """
         map_location = device if device else 'cpu'
-        checkpoint = torch.load(checkpoint_path, map_location=map_location)
+        checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
         
         # Load model weights
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -209,6 +221,13 @@ class CheckpointManager:
         if scheduler is not None and 'scheduler_state_dict' in checkpoint:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             print(f"  ✓ Loaded scheduler state")
+        
+        # Report EMA state availability
+        if 'ema_state_dict' in checkpoint:
+            num_shadows = len(checkpoint['ema_state_dict'].get('shadow', {}))
+            print(f"  ✓ EMA state available ({num_shadows} shadow params)")
+        else:
+            print(f"  ⚠ No EMA state in checkpoint (EMA will reinitialize from model weights)")
         
         # Print loaded metrics
         if 'metrics' in checkpoint and checkpoint['metrics']:
@@ -256,6 +275,34 @@ class CheckpointManager:
         """Save training history to file."""
         with open(self.history_file, 'w') as f:
             json.dump(self.history, f, indent=2)
+    
+    def _restore_best_from_history(self):
+        """
+        Restore best_checkpoints list from training history.
+        
+        Fixes the 'amnesia bug': without this, after creating a fresh
+        CheckpointManager on resume, best_checkpoints is empty and
+        is_best() always returns True, falsely labeling the first
+        validation as 'NEW BEST'.
+        """
+        if not self.history:
+            return
+        
+        for entry in self.history:
+            if entry.get('is_best') and entry.get('metrics'):
+                metric_val = entry['metrics'].get(self.metric_name)
+                ckpt_name = entry.get('checkpoint', '')
+                if metric_val is not None:
+                    ckpt_path = str(self.checkpoint_dir / ckpt_name)
+                    self.best_checkpoints.append((metric_val, ckpt_path))
+        
+        # Sort and keep best K
+        if self.best_checkpoints:
+            if self.mode == 'max':
+                self.best_checkpoints.sort(key=lambda x: x[0], reverse=True)
+            else:
+                self.best_checkpoints.sort(key=lambda x: x[0])
+            self.best_checkpoints = self.best_checkpoints[:self.keep_best_k]
     
     def should_save(self, epoch: int) -> bool:
         """Check if should save checkpoint at this epoch."""
@@ -322,6 +369,33 @@ class EMAModel:
                 self.shadow[name] = param.data.clone()
                 if device:
                     self.shadow[name] = self.shadow[name].to(device)
+    
+    def state_dict(self) -> Dict[str, Any]:
+        """Return serializable state for checkpoint saving."""
+        return {
+            'shadow': {k: v.cpu() for k, v in self.shadow.items()},
+            'decay': self.decay,
+        }
+    
+    def load_state_dict(self, state: Dict[str, Any]):
+        """
+        Restore EMA state from a checkpoint.
+        
+        Args:
+            state: Dict with 'shadow' and 'decay' keys
+        """
+        if 'decay' in state:
+            self.decay = state['decay']
+        
+        if 'shadow' in state:
+            loaded_shadow = state['shadow']
+            restored = 0
+            for name, param in loaded_shadow.items():
+                if name in self.shadow:
+                    target_device = self.shadow[name].device
+                    self.shadow[name] = param.to(target_device)
+                    restored += 1
+            print(f"  ✓ EMA restored: {restored}/{len(self.shadow)} shadow params")
     
     def update(self, model: torch.nn.Module):
         """Update shadow parameters with current model."""
@@ -457,6 +531,56 @@ def test_checkpoint_manager():
     ema.apply(model)
     ema.restore(model, backup)
     print("    EMA update, apply, restore: OK")
+    print("  [PASSED]")
+    
+    print("\n--- Test 6: EMA Save/Load Round-Trip ---")
+    # Save checkpoint WITH EMA state
+    manager.save_checkpoint(
+        epoch=10,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        metrics={'psnr': 35.0, 'ssim': 0.96},
+        is_best=True,
+        ema=ema
+    )
+    
+    # Grab the shadow values BEFORE save (for comparison)
+    original_shadows = {k: v.clone() for k, v in ema.shadow.items()}
+    
+    # Create a fresh model + fresh EMA (simulating a restart)
+    new_model2 = nn.Sequential(
+        nn.Linear(10, 20),
+        nn.ReLU(),
+        nn.Linear(20, 10)
+    )
+    new_optimizer2 = torch.optim.Adam(new_model2.parameters())
+    new_ema = EMAModel(new_model2, decay=0.999)
+    
+    # Verify shadows are different before restore
+    any_different = False
+    for name in original_shadows:
+        if name in new_ema.shadow and not torch.equal(original_shadows[name], new_ema.shadow[name]):
+            any_different = True
+            break
+    assert any_different, "Fresh EMA should differ from trained EMA"
+    
+    # Load the checkpoint
+    latest = manager.get_latest_checkpoint()
+    ckpt = manager.load_checkpoint(latest, new_model2, new_optimizer2, load_optimizer=True)
+    
+    # Restore EMA from checkpoint
+    assert 'ema_state_dict' in ckpt, "Checkpoint should contain ema_state_dict"
+    new_ema.load_state_dict(ckpt['ema_state_dict'])
+    
+    # Verify shadows match after restore
+    for name in original_shadows:
+        assert name in new_ema.shadow, f"Missing shadow param: {name}"
+        assert torch.allclose(original_shadows[name], new_ema.shadow[name], atol=1e-6), \
+            f"Shadow mismatch for {name}"
+    
+    print("    EMA state_dict() → save → load → load_state_dict(): OK")
+    print("    Shadow weights match original: OK")
     print("  [PASSED]")
     
     # Cleanup

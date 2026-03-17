@@ -1,0 +1,25 @@
+Pretrained model weights for team29_FreqFusion
+================================================
+
+1. Fusion Network Checkpoint (~12 MB):
+   INCLUDED in this repository at:
+   checkpoints/phase5_single_gpu/championship_sr_phase5_single_gpu/best_epoch0050_psnr30.05.pth
+
+2. Expert Model Weights (download from Google Drive):
+   https://drive.google.com/drive/folders/1m8cMpiqlAzOT2-2S2x0OhMSu4Fcfqj-A?usp=sharing
+
+   Place downloaded files in ./pretrained/ directory:
+     pretrained/
+     ├── hat/
+     │   └── HAT-L_SRx4_ImageNet-pretrain.pth
+     ├── dat/
+     │   └── DAT_x4.pth
+     └── nafnet/
+         └── NAFNet-SIDD-width64.pth
+
+   Expert details:
+   - HAT-L (40.84M params): Hybrid Attention Transformer
+   - DAT (11.21M params): Dual Aggregation Transformer
+   - NAFNet-64 (~67M params): Nonlinear Activation-Free Network
+
+Total model size: ~100M (frozen experts) + ~1.2M (trainable fusion) ≈ 101M parameters

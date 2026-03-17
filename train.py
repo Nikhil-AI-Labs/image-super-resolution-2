@@ -957,6 +957,20 @@ def train(config: Dict, resume_path: Optional[str] = None, args = None):
         start_epoch = checkpoint['epoch'] + 1
         if 'metrics' in checkpoint and 'psnr' in checkpoint['metrics']:
             best_psnr = checkpoint['metrics']['psnr']
+        
+        # Restore EMA shadow weights from checkpoint (critical for PSNR!)
+        if ema is not None and 'ema_state_dict' in checkpoint:
+            ema.load_state_dict(checkpoint['ema_state_dict'])
+            print(f"  ✓ EMA shadow weights restored from checkpoint")
+        elif ema is not None:
+            print(f"  ⚠ No EMA state in checkpoint — EMA initialized from current model weights")
+        
+        # Restore best_psnr from checkpoint manager history (fixes amnesia bug)
+        historical_best = checkpoint_manager.get_best_metric()
+        if historical_best is not None:
+            best_psnr = max(best_psnr, historical_best)
+            print(f"  ✓ Historical best PSNR restored: {best_psnr:.2f} dB")
+        
         print(f"  Resuming from epoch {start_epoch}, best PSNR: {best_psnr:.2f} dB")
     
     # ========================================================================
@@ -1132,7 +1146,8 @@ def train(config: Dict, resume_path: Optional[str] = None, args = None):
                 scheduler=scheduler,
                 metrics=val_metrics,
                 is_best=is_best,
-                extra_state={'stage': stage_num}
+                extra_state={'stage': stage_num},
+                ema=ema
             )
         # ==========================================================
         

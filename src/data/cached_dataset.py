@@ -42,12 +42,29 @@ class CachedSRDataset(Dataset):
     
     Achieves 10-20x training speedup by skipping expert model inference.
     
+    Supports two file naming conventions:
+        OLD (1 crop per image):
+            {stem}_hat_part.pt  + {stem}_rest_part.pt
+        NEW (5 crops per image):
+            {stem}_p{0-4}_drct_part.pt + {stem}_p{0-4}_rest_part.pt
+            OR {stem}_p{0-4}_hat_part.pt + {stem}_p{0-4}_rest_part.pt
+    
+    Expert key mapping (automatic):
+        drct → hat,  grl → dat  (so model always sees hat/dat/nafnet)
+    
     Args:
         feature_dir: Path to cached features directory
         augment: Enable geometric augmentations (flip, rotate)
         repeat_factor: Repeat dataset for more training samples per epoch
         load_features: Whether to load intermediate features (for collaborative learning)
     """
+    
+    # Map new expert names → canonical names expected by the model
+    EXPERT_KEY_MAP = {
+        'drct': 'hat',
+        'grl': 'dat',
+        # hat, dat, nafnet pass through unchanged
+    }
     
     def __init__(
         self,
@@ -67,17 +84,28 @@ class CachedSRDataset(Dataset):
         if not self.feature_dir.exists():
             raise RuntimeError(f"Feature cache directory not found: {feature_dir}")
         
-        # Find all unique filenames by looking for _hat_part.pt files
+        # Auto-detect naming convention
+        # Priority: _hat_part.pt (old or new), then _drct_part.pt (new 5-crop)
         hat_files = sorted(list(self.feature_dir.glob("*_hat_part.pt")))
+        drct_files = sorted(list(self.feature_dir.glob("*_drct_part.pt")))
         
-        if len(hat_files) == 0:
+        if len(hat_files) > 0:
+            self._sentinel_suffix = "_hat_part.pt"
+            self._primary_key = "hat"
+            sentinel_files = hat_files
+        elif len(drct_files) > 0:
+            self._sentinel_suffix = "_drct_part.pt"
+            self._primary_key = "drct"
+            sentinel_files = drct_files
+        else:
             raise RuntimeError(
                 f"No cached features found in {feature_dir}!\n"
-                f"Run 'python scripts/extract_features_balanced.py' first."
+                f"Expected *_hat_part.pt or *_drct_part.pt files.\n"
+                f"Run extraction script first."
             )
         
-        # Extract filename stems (without _hat_part.pt suffix)
-        self.file_stems = [f.name.replace('_hat_part.pt', '') for f in hat_files]
+        # Extract filename stems (without sentinel suffix)
+        self.file_stems = [f.name.replace(self._sentinel_suffix, '') for f in sentinel_files]
         
         # Verify matching rest_part files exist
         missing = []
@@ -93,6 +121,7 @@ class CachedSRDataset(Dataset):
         
         print(f"CachedSRDataset initialized:")
         print(f"  Directory: {feature_dir}")
+        print(f"  Naming format: *{self._sentinel_suffix} + *_rest_part.pt")
         print(f"  Samples: {len(self.file_stems)}")
         print(f"  Repeat factor: {repeat_factor}")
         print(f"  Effective length: {len(self)}")
@@ -119,21 +148,21 @@ class CachedSRDataset(Dataset):
         file_idx = idx % len(self.file_stems)
         stem = self.file_stems[file_idx]
         
-        # Load both parts
-        hat_path = self.feature_dir / f"{stem}_hat_part.pt"
+        # Load both parts (using auto-detected naming)
+        primary_path = self.feature_dir / f"{stem}{self._sentinel_suffix}"
         rest_path = self.feature_dir / f"{stem}_rest_part.pt"
         
-        data_hat = torch.load(hat_path, weights_only=False)
+        data_primary = torch.load(primary_path, weights_only=False)
         data_rest = torch.load(rest_path, weights_only=False)
         
-        # Extract LR/HR from HAT part (they're stored there)
-        lr = data_hat['lr']  # [3, H, W]
-        hr = data_hat['hr']  # [3, H*4, W*4]
+        # Extract LR/HR from primary part (they're stored there)
+        lr = data_primary['lr']  # [3, H, W]
+        hr = data_primary['hr']  # [3, H*4, W*4]
         
-        # Merge expert outputs
+        # Merge expert outputs and normalize keys (drct→hat, grl→dat)
         expert_imgs = {}
-        expert_imgs.update(data_hat['outputs'])
-        expert_imgs.update(data_rest['outputs'])
+        expert_imgs.update(self._normalize_keys(data_primary['outputs']))
+        expert_imgs.update(self._normalize_keys(data_rest['outputs']))
         
         # Squeeze batch dimension if present
         for name in expert_imgs:
@@ -144,8 +173,8 @@ class CachedSRDataset(Dataset):
         expert_feats = None
         if self.load_features:
             expert_feats = {}
-            expert_feats.update(data_hat.get('features', {}))
-            expert_feats.update(data_rest.get('features', {}))
+            expert_feats.update(self._normalize_keys(data_primary.get('features', {})))
+            expert_feats.update(self._normalize_keys(data_rest.get('features', {})))
             
             # Squeeze batch dimension if present
             for name in expert_feats:
@@ -170,13 +199,25 @@ class CachedSRDataset(Dataset):
         
         return result
     
+    def _normalize_keys(self, d: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Normalize expert keys to canonical names (hat, dat, nafnet).
+        
+        Maps: drct→hat, grl→dat. Other keys pass through unchanged.
+        """
+        normalized = {}
+        for k, v in d.items():
+            canonical = self.EXPERT_KEY_MAP.get(k, k)
+            normalized[canonical] = v
+        return normalized
+    
     def _apply_augmentation(
         self,
         lr: torch.Tensor,
         hr: torch.Tensor,
         expert_imgs: Dict[str, torch.Tensor],
         expert_feats: Optional[Dict[str, torch.Tensor]]
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
         """
         Apply geometric augmentations consistently to all tensors.
         

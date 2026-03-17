@@ -1,5 +1,6 @@
 # ============================================================================
-# Image Super Resolution - .gitignore
+# NTIRE 2026 Image SR x4 — Team 29: FreqFusion
+# .gitignore
 # ============================================================================
 
 # ---- Python ----
@@ -12,18 +13,22 @@ dist/
 build/
 .eggs/
 
-# ---- Pretrained weights (too large, stored on Google Drive) ----
+# ---- Pretrained expert weights (too large for GitHub, stored on Google Drive) ----
 pretrained/
 *.safetensors
 
 # ---- Dataset images (download separately) ----
 DIV2K_test_LR_bicubic/
 dataset/
+input/
+output/
 
 # ---- Training outputs ----
 logs/
 outputs/
 results/
+NTIRE2026-ImageSRx4/
+*.log
 
 # ---- Environment ----
 .env
@@ -44,3 +49,13 @@ Thumbs.db
 # ---- Misc ----
 *.zip
 *.tar.gz
+
+# ---- LaTeX build artifacts (keep .tex source files) ----
+factsheet/*.aux
+factsheet/*.log
+factsheet/*.out
+factsheet/*.synctex.gz
+factsheet/*.fdb_latexmk
+factsheet/*.fls
+factsheet/*.bbl
+factsheet/*.blg
